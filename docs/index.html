@@ -60,6 +60,15 @@
   .side.hold { background:rgba(139,148,158,.18); color:var(--muted); }
   .why { color:var(--muted); min-width:280px; }
   .empty { color:var(--muted); font-style:italic; }
+  .card.err { border-color:var(--down); }
+  .card.err h3 { color:var(--down); }
+  details { margin-top:12px; }
+  summary { cursor:pointer; color:var(--muted); font-size:13px;
+    padding:6px 0; user-select:none; }
+  summary:hover { color:var(--fg); }
+  pre { background:var(--bg); border:1px solid var(--line); border-radius:6px;
+    padding:12px; overflow-x:auto; font-size:12px; line-height:1.45;
+    white-space:pre-wrap; word-break:break-word; margin:6px 0 0; }
   footer { color:var(--muted); font-size:12px; border-top:1px solid var(--line);
     padding-top:14px; }
 </style>
@@ -69,6 +78,8 @@
   <p class="stamp">Updated 27 Aug 2026, 02:31 WIB</p>
 
   <div class="tiles"><div class="tile"><h2>Bot equity</h2><p class="value ">$100,000.00</p><p class="sub">+0.00% since start</p></div><div class="tile"><h2>vs SPY</h2><p class="value down">-116.20</p><p class="sub">SPY at $100,116.20</p></div><div class="tile"><h2>vs QQQ</h2><p class="value down">-129.35</p><p class="sub">QQQ at $100,129.35</p></div><div class="tile"><h2>Runs / orders</h2><p class="value ">2 / 0</p><p class="sub">none rejected</p></div></div>
+
+  
 
   <div class="card">
     <h3>Equity vs benchmarks</h3>

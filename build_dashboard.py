@@ -177,7 +177,22 @@ def render(events, demo=False):
     rows_html = "".join(rows) or ('<tr><td colspan="6" class="empty">'
                                   'no orders yet</td></tr>')
 
+    def esc(t):
+        return (clean(t).replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;"))
+
+    # surface the last LLM failure, if it is more recent than the last success
+    errors = [e for e in events if e.get("type") == "llm_error"]
     decision_events = [e for e in events if e.get("type") == "decisions"]
+    err_html = ""
+    if errors and (not decision_events
+                   or errors[-1].get("timestamp", "") > decision_events[-1].get("timestamp", "")):
+        err = errors[-1]
+        err_html = (f'<div class="card err"><h3>Last run failed</h3>'
+                    f'<p class="sub">{when(err.get("timestamp"))} · '
+                    f'{esc(err.get("model", "?"))}</p>'
+                    f'<pre>{esc(err.get("error", ""))}</pre></div>')
+
     last_call = decision_events[-1] if decision_events else None
     if last_call:
         calls = last_call.get("decisions") or []
@@ -188,12 +203,26 @@ def render(events, demo=False):
             f'<td class="why">{clean(d.get("reasoning")).strip() or "-"}</td></tr>'
             for d in calls)
         acted = sum(1 for d in calls if d.get("action") in ("buy", "sell"))
+        usage = last_call.get("usage") or {}
+        toks = (f' · {usage.get("prompt_tokens", "?")} in / '
+                f'{usage.get("completion_tokens", "?")} out' if usage else "")
+        raw = last_call.get("raw") or ""
+        thinking = last_call.get("thinking") or ""
+        blocks = ""
+        if thinking:
+            blocks += (f'<details><summary>Model thinking '
+                       f'({len(thinking)} chars)</summary>'
+                       f'<pre>{esc(thinking)}</pre></details>')
+        if raw:
+            blocks += (f'<details><summary>Raw model response</summary>'
+                       f'<pre>{esc(raw)}</pre></details>')
         think_html = (
             f'<p class="sub">{len(last_call.get("candidates") or [])} candidates '
-            f'screened · {acted} acted on · {when(last_call.get("timestamp"))}</p>'
+            f'screened · {acted} acted on · {when(last_call.get("timestamp"))}'
+            f'<br>{esc(last_call.get("model", "?"))}{toks}</p>'
             f'<div class="scroll"><table><thead><tr><th>Symbol</th><th>Call</th>'
             f'<th>Reasoning</th></tr></thead><tbody>{drows or ""}</tbody>'
-            f'</table></div>')
+            f'</table></div>{blocks}')
     else:
         think_html = ('<p class="empty">no decisions logged yet. This fills in '
                       'on the next run</p>')
@@ -267,6 +296,15 @@ def render(events, demo=False):
   .side.hold {{ background:rgba(139,148,158,.18); color:var(--muted); }}
   .why {{ color:var(--muted); min-width:280px; }}
   .empty {{ color:var(--muted); font-style:italic; }}
+  .card.err {{ border-color:var(--down); }}
+  .card.err h3 {{ color:var(--down); }}
+  details {{ margin-top:12px; }}
+  summary {{ cursor:pointer; color:var(--muted); font-size:13px;
+    padding:6px 0; user-select:none; }}
+  summary:hover {{ color:var(--fg); }}
+  pre {{ background:var(--bg); border:1px solid var(--line); border-radius:6px;
+    padding:12px; overflow-x:auto; font-size:12px; line-height:1.45;
+    white-space:pre-wrap; word-break:break-word; margin:6px 0 0; }}
   footer {{ color:var(--muted); font-size:12px; border-top:1px solid var(--line);
     padding-top:14px; }}
 </style>
@@ -276,6 +314,8 @@ def render(events, demo=False):
   <p class="stamp">Updated {when_full(latest.get('timestamp'))}</p>
 
   <div class="tiles">{tile_html}</div>
+
+  {err_html}
 
   <div class="card">
     <h3>Equity vs benchmarks</h3>
@@ -325,6 +365,12 @@ def demo_events(runs=40):
         events.append({
             "type": "decisions", "timestamp": stamp,
             "candidates": names + ["SPY", "QQQ"],
+            "model": "deepseek/deepseek-v4-flash",
+            "usage": {"prompt_tokens": 1840, "completion_tokens": 412},
+            "thinking": "Scanning the pool for anything with a real intraday "
+                        "trend. Most names are flat. Checking volume next.",
+            "raw": '{"decisions": [{"ticker": "NVDA", "action": "hold", '
+                   '"reasoning": "flat tape"}]}',
             "decisions": [
                 {"ticker": n, "action": "hold",
                  "reasoning": f"{n} is drifting sideways on thinning volume; "
@@ -355,8 +401,14 @@ def selfcheck():
     assert "no orders yet" in empty and "Not enough data" in empty
     page = render(demo_events(), demo=True)
     for must in ("DEMO DATA", "vs SPY", "vs QQQ", "<polyline", "NVDA",
-                 "candidates", "HOLD", "every candidate it looked at"):
+                 "candidates", "HOLD", "every candidate it looked at",
+                 "Raw model response", "Model thinking", "1840 in / 412 out"):
         assert must in page, must
+    # a failed call must be visible, and its text escaped not executed
+    broke = render([{"type": "llm_error", "timestamp": "2026-01-02T00:00:00+00:00",
+                     "model": "x/y", "error": "boom <script>alert(1)</script>"}])
+    assert "Last run failed" in broke and "&lt;script&gt;" in broke
+    assert "<script>alert" not in broke
     # holds must survive even when nothing was traded
     holds_only = render([{"type": "decisions", "timestamp": "2026-01-01T00:00:00+00:00",
                           "candidates": ["AAA"], "decisions": [

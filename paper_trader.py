@@ -59,6 +59,8 @@ import requests
 SCREEN_TOP = 15            # how many to pull from each screener
 MAX_CANDIDATES = 20        # cap on the pool sent to the LLM (token cost)
 MIN_PRICE = 5.00           # skip sub-$5 names; screeners surface junk
+TARGET_DEPLOYED_PCT = 60   # how much equity the model is told to put to work
+MAX_PER_NAME_PCT = 25      # and the most it should put in any single name
 BENCHMARKS = ["SPY", "QQQ"]  # buy & hold comparisons, tracked separately
 
 BAR_TIMEFRAME = "5Min"                 # 1Min, 5Min, 15Min, 1Hour...
@@ -253,16 +255,26 @@ Candidates (today's most-active names and biggest movers, Alpaca IEX feed,
 references — you may trade them like anything else:
 {json.dumps(market_data, indent=2)}
 
-YOU choose which of these to trade. You are not required to trade any of
-them — returning all holds is a valid and often correct answer.
+YOU choose which of these to trade, and this is an ACTIVE intraday
+experiment. Cash sitting idle earns nothing and generates no data to learn
+from, so bias toward taking positions.
+
+- Aim to keep roughly {TARGET_DEPLOYED_PCT}% of total equity deployed,
+  spread across about 2 to 5 names.
+- Act whenever the data gives you a defensible reason. You do not need high
+  conviction or a textbook setup; a modest edge is enough.
+- Hold a name only when it genuinely offers nothing to act on. Do not
+  return all holds as a default.
+- If you are already near the target deployment, rotate: sell what looks
+  weakest and buy what looks strongest, rather than sitting still.
 
 For each ticker you want to act on, give: buy, sell, or hold.
 - If buy: specify dollar amount to allocate (must not exceed available cash
   across all buys combined; minimum ${MIN_NOTIONAL:.2f} per order).
 - If sell: specify number of shares to sell (must not exceed current holding).
 - Include every ticker you currently hold, so each position gets a decision.
-- Concentrating everything in one name is allowed but risky; you carry these
-  positions into future runs and there are no stop losses.
+- Keep any single position under about {MAX_PER_NAME_PCT}% of equity. You
+  carry positions into future runs and there are no stop losses.
 - Always give brief reasoning (1-2 sentences) grounded in the data provided.
 - Do not invent information not present in the data above. The candidate
   list changes every run; you have no memory of previous runs.
@@ -301,8 +313,12 @@ def call_llm(prompt):
             "model": MODEL,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.3,
+            # route to whichever host serves this model cheapest
+            "provider": {"sort": "price"},
+            # models that support thinking will use it; the rest ignore this
+            "reasoning": {"effort": "high"},
         },
-        timeout=60,
+        timeout=120,
     )
     resp.raise_for_status()
     choice = resp.json()["choices"][0]
@@ -312,7 +328,15 @@ def call_llm(prompt):
         raise RuntimeError(
             "model reply was truncated at its own output limit, so the JSON is "
             "incomplete. Lower MAX_CANDIDATES or pick a model with more room.")
-    return _extract_json(choice["message"]["content"])
+    body = resp.json()
+    content = choice["message"]["content"]
+    meta = {
+        "model": body.get("model") or MODEL,
+        "raw": (content or "")[:4000],
+        "thinking": (choice["message"].get("reasoning") or "")[:4000],
+        "usage": body.get("usage") or {},
+    }
+    return _extract_json(content), meta
 
 # ----------------------------- ORDERS -------------------------------------
 
@@ -414,9 +438,11 @@ def run_once():
     baseline = load_baseline(market_data, float(account["equity"]))
 
     try:
-        decisions = call_llm(build_prompt(market_data, account, positions))
+        decisions, meta = call_llm(build_prompt(market_data, account, positions))
     except Exception as e:
         print(f"LLM call failed: {e}")
+        # logged, not just printed, so the dashboard can show what broke
+        log_event({"type": "llm_error", "model": MODEL, "error": str(e)[:1000]})
         return True
 
     # Log every decision, not just the ones that became orders. Holds are
@@ -424,6 +450,10 @@ def run_once():
     # interesting half of the experiment.
     log_event({
         "type": "decisions",
+        "model": meta["model"],
+        "raw": meta["raw"],
+        "thinking": meta["thinking"],
+        "usage": meta["usage"],
         "candidates": sorted(t for t in market_data if t not in BENCHMARKS),
         "decisions": [
             {"ticker": d.get("ticker"),

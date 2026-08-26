@@ -1,0 +1,10 @@
+# NEVER commit this — the repo is public
+secret.env
+.env
+
+__pycache__/
+*.pyc
+
+# NOTE: baseline_state.json and trade_log.jsonl are deliberately NOT ignored.
+# The workflow commits them back after each run; without them the baseline
+# reseeds every run and the SPY/QQQ comparison silently reads zero.

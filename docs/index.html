@@ -1,0 +1,94 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LLM Paper Trading</title>
+<style>
+  :root {
+    --bg:#ffffff; --panel:#f6f8fa; --line:#d8dee4;
+    --fg:#1f2328; --muted:#636c76; --up:#1a7f37; --down:#cf222e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#0d1117; --panel:#161b22; --line:#30363d;
+      --fg:#e6edf3; --muted:#8b949e; --up:#3fb950; --down:#f85149;
+    }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:24px; background:var(--bg); color:var(--fg);
+    font:15px/1.5 ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  .wrap { max-width:1040px; margin:0 auto; }
+  h1 { font-size:20px; margin:0 0 2px; }
+  .stamp { color:var(--muted); font-size:13px; margin:0 0 20px; }
+  .banner { background:#bf8700; color:#fff; padding:10px 14px;
+    border-radius:8px; margin-bottom:18px; font-weight:600; font-size:14px; }
+  .banner code { background:rgba(0,0,0,.2); padding:1px 5px; border-radius:4px; }
+  .tiles { display:grid; gap:12px; margin-bottom:22px;
+    grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); }
+  .tile { background:var(--panel); border:1px solid var(--line);
+    border-radius:10px; padding:14px 16px; }
+  .tile h2 { font-size:12px; text-transform:uppercase; letter-spacing:.05em;
+    color:var(--muted); margin:0 0 6px; font-weight:600; }
+  .value { font-size:24px; font-weight:650; margin:0;
+    font-variant-numeric:tabular-nums; }
+  .value.up { color:var(--up); } .value.down { color:var(--down); }
+  .sub { color:var(--muted); font-size:12px; margin:4px 0 0; }
+  .card { background:var(--panel); border:1px solid var(--line);
+    border-radius:10px; padding:16px; margin-bottom:22px; }
+  .card h3 { font-size:13px; text-transform:uppercase; letter-spacing:.05em;
+    color:var(--muted); margin:0 0 12px; font-weight:600; }
+  svg { width:100%; height:300px; display:block; }
+  .grid { stroke:var(--line); stroke-width:1; }
+  .tick { fill:var(--muted); font-size:11px; }
+  .key { display:inline-flex; align-items:center; gap:6px; margin-right:14px;
+    font-size:13px; color:var(--muted); }
+  .key i { width:11px; height:3px; border-radius:2px; display:inline-block; }
+  ul.held { list-style:none; margin:0; padding:0; display:flex;
+    flex-wrap:wrap; gap:8px; }
+  ul.held li { background:var(--bg); border:1px solid var(--line);
+    border-radius:6px; padding:4px 10px; font-weight:600; font-size:14px; }
+  .scroll { overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  th { text-align:left; color:var(--muted); font-size:11px;
+    text-transform:uppercase; letter-spacing:.05em; padding:0 10px 8px 0; }
+  td { padding:8px 10px 8px 0; border-top:1px solid var(--line);
+    vertical-align:top; }
+  .nowrap { white-space:nowrap; }
+  .sym { font-weight:650; }
+  .side { font-weight:700; font-size:11px; padding:2px 6px; border-radius:4px; }
+  .side.buy { background:rgba(63,185,80,.15); color:var(--up); }
+  .side.sell { background:rgba(248,81,73,.15); color:var(--down); }
+  .why { color:var(--muted); min-width:280px; }
+  .empty { color:var(--muted); font-style:italic; }
+  footer { color:var(--muted); font-size:12px; border-top:1px solid var(--line);
+    padding-top:14px; }
+</style>
+<div class="wrap">
+  
+  <h1>LLM Paper Trading</h1>
+  <p class="stamp">Alpaca paper account · fake money · updated never</p>
+
+  <div class="tiles"><div class="tile"><h2>Bot equity</h2><p class="value ">$0.00</p><p class="sub">—</p></div><div class="tile"><h2>Runs / orders</h2><p class="value ">0 / 0</p><p class="sub">none rejected</p></div></div>
+
+  <div class="card">
+    <h3>Equity vs benchmarks</h3>
+    <p class="empty">Not enough data for a chart yet — needs at least two runs.</p>
+    <div></div>
+  </div>
+
+  <div class="card">
+    <h3>Currently held</h3>
+    <ul class="held"><li class="empty">no open positions</li></ul>
+  </div>
+
+  <div class="card">
+    <h3>Recent decisions</h3>
+    <div class="scroll"><table>
+      <thead><tr><th>When</th><th>Side</th><th>Symbol</th><th>Size</th>
+      <th>Fill</th><th>Reasoning</th></tr></thead>
+      <tbody><tr><td colspan="6" class="empty">no orders yet</td></tr></tbody>
+    </table></div>
+  </div>
+
+  <footer>Simulated trading only — no real money is involved. The bot beating
+  or losing to a benchmark over days means nothing; judge it over months.</footer>
+</div>

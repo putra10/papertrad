@@ -1,0 +1,54 @@
+name: paper-trade
+
+on:
+  schedule:
+    # Cron is UTC and cannot follow US daylight saving, so this covers both
+    # EDT (13:30-20:00 UTC) and EST (14:30-21:00 UTC). Runs outside market
+    # hours cost one Alpaca clock call and exit — the script checks.
+    # Offset minutes avoid the congested :00/:15/:30/:45 slots.
+    - cron: "7,22,37,52 13-21 * * 1-5"
+  workflow_dispatch:        # lets you trigger a run by hand from the Actions tab
+
+permissions:
+  contents: write           # needed to commit state + dashboard back
+
+concurrency:
+  group: paper-trade        # never let two runs trade the same account at once
+  cancel-in-progress: false
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest  # 1x minute multiplier; windows would be 2x
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests
+
+      - name: Run one trading cycle
+        env:
+          APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
+          APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: python paper_trader.py
+
+      - name: Rebuild dashboard
+        run: python build_dashboard.py
+
+      - name: Commit state and dashboard
+        run: |
+          git config user.name  "paper-trader-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A baseline_state.json trade_log.jsonl docs/
+          if git diff --staged --quiet; then
+            echo "nothing changed (market probably closed)"
+          else
+            git commit -m "run $(date -u '+%Y-%m-%d %H:%M UTC')"
+            git pull --rebase --autostash
+            git push
+          fi

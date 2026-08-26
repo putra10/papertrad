@@ -395,8 +395,8 @@ def run_once():
     print(f"\n=== Run at {datetime.now(timezone.utc).isoformat()} ===")
     clock = get_clock()
     if not clock["is_open"]:
-        print(f"Market closed. Next open: {clock['next_open']}. Skipping.")
-        return
+        print(f"Market closed. Next open: {clock['next_open']}.")
+        return False
 
     account = get_account()
     positions = get_positions()
@@ -404,8 +404,8 @@ def run_once():
     candidates = fetch_candidates(positions.keys())
     market_data = fetch_market_data(candidates, clock["timestamp"][:10])
     if not market_data:
-        print("No market data returned. Skipping.")
-        return
+        print("No market data returned. Skipping this cycle.")
+        return True
     # drop penny/junk names, but never drop something we hold or the benchmark
     market_data = {t: d for t, d in market_data.items()
                    if d["last_price"] >= MIN_PRICE or t in positions or t in BENCHMARKS}
@@ -417,7 +417,7 @@ def run_once():
         decisions = call_llm(build_prompt(market_data, account, positions))
     except Exception as e:
         print(f"LLM call failed: {e}")
-        return
+        return True
 
     # Log every decision, not just the ones that became orders. Holds are
     # most of what the model does, and its reasoning for passing is the
@@ -467,17 +467,64 @@ def run_once():
     log_event({"type": "snapshot", "bot_value": round(bot_value, 2),
                "baselines": {b: round(v, 2) for b, v in bases.items()},
                "held": sorted(positions)})
+    return True
 
 
-def run_loop(interval_minutes=15):
-    """Poll continuously. Ctrl+C to stop. Closed-market runs no-op cheaply."""
-    print(f"Starting loop, polling every {interval_minutes} minutes. Ctrl+C to stop.")
-    while True:
+def sync_to_git():
+    """Commit and push state, if AUTO_COMMIT=1. Used by --session in CI.
+
+    The session job can be killed at the runner's 6-hour ceiling, so state
+    is pushed every cycle rather than once at the end.
+    """
+    if os.environ.get("AUTO_COMMIT") != "1":
+        return
+    import subprocess
+    here = str(Path(__file__).parent)
+
+    def sh(*args):
+        return subprocess.run(args, cwd=here, capture_output=True, text=True)
+
+    sh("python", "build_dashboard.py")
+    sh("git", "add", "-A", "baseline_state.json", "trade_log.jsonl", "docs")
+    if sh("git", "diff", "--staged", "--quiet").returncode == 0:
+        return                                    # nothing changed this cycle
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    sh("git", "commit", "-m", f"run {stamp}")
+    sh("git", "pull", "--rebase", "--autostash")
+    pushed = sh("git", "push")
+    if pushed.returncode:
+        print(f"  [warn] push failed: {pushed.stderr[:200]}")
+
+
+def run_loop(interval_minutes=15, until_close=False, max_hours=5.75):
+    """Poll on a fixed interval. Ctrl+C to stop.
+
+    until_close=True is the CI mode: exit as soon as the session ends, and
+    exit immediately if the market was already closed on the first check,
+    so a backup trigger that fires after hours costs one API call.
+    max_hours keeps the job under the runner's 6-hour ceiling.
+    """
+    print(f"Polling every {interval_minutes} min"
+          + (f", until the close (max {max_hours}h)." if until_close else ". Ctrl+C to stop."))
+    deadline = time.monotonic() + max_hours * 3600
+    seen_open = False
+    while time.monotonic() < deadline:
         try:
-            run_once()
+            is_open = run_once()
+            if until_close:
+                if is_open:
+                    seen_open = True
+                elif seen_open:
+                    print("Session over. Exiting.")
+                    return
+                else:
+                    print("Market was already closed. Nothing to do.")
+                    return
+            sync_to_git()
         except Exception as e:
             print(f"Unexpected error: {e}")
         time.sleep(interval_minutes * 60)
+    print(f"Hit the {max_hours}h cap. Exiting so the job finishes cleanly.")
 
 
 def selftest():
@@ -543,5 +590,8 @@ if __name__ == "__main__":
         show_screen()
     elif arg == "--loop":
         run_loop(int(sys.argv[2]) if len(sys.argv) > 2 else 15)
+    elif arg == "--session":
+        # one CI job covers the whole trading session
+        run_loop(int(sys.argv[2]) if len(sys.argv) > 2 else 15, until_close=True)
     else:
         run_once()

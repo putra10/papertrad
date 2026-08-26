@@ -112,23 +112,36 @@ At ~36 runs/day this matters. Nothing sensitive is committed — see below.
    instead of waiting for the schedule.
 
 The workflow is [.github/workflows/trade.yml](.github/workflows/trade.yml).
-Notes on how it is set up:
 
-- **Schedule is 13:00–21:00 UTC, Mon–Fri.** Cron cannot follow US daylight
-  saving, so that window covers both EDT and EST. Runs that land outside
-  market hours cost one Alpaca clock call and exit.
-- **Minutes are offset** (`7,22,37,52`) because `:00/:15/:30/:45` are the
-  most congested slots on GitHub's scheduler.
-- **Scheduled runs can be late.** GitHub documents delays under load —
-  sometimes 10–30 minutes, occasionally skipped entirely. For a 15-minute
-  intraday cadence that is a real limitation, not a cosmetic one. If it
-  bothers you, move to an always-free VM (Oracle Cloud, GCP e2-micro) with
-  a normal cron.
-- **State is committed back** after each run. `baseline_state.json` must
-  survive between runs or the baseline reseeds every time and the SPY/QQQ
-  comparison silently reads zero. This also keeps the repo active, which
-  matters because GitHub disables cron on repos with no commits for 60 days.
-- **`concurrency`** prevents two runs from trading the same account at once.
+**It fires once per session, not every 15 minutes.** That is deliberate.
+GitHub's scheduler is unreliable at short intervals: a `*/15` cron runs
+late and silently drops slots, and asking it for 36 fires a day gives it
+36 chances to fail. Instead it fires once, and `paper_trader.py --session`
+holds the 15-minute cadence itself with real sleeps. The cadence becomes
+exact; only the start time is at GitHub's mercy.
+
+This costs about 6 hours of runner time per day. On a **public** repo that
+is free and unlimited, which is the whole reason the repo is public. If
+you ever make it private, this blows through the 2,000 minute allowance in
+under a week.
+
+How it is set up:
+
+- **Two triggers, 13:35 and 14:35 UTC.** Cron cannot follow US daylight
+  saving. 13:35 UTC is 09:35 ET in summer, 14:35 UTC is 09:35 ET in
+  winter. Whichever lands while the market is open runs the session; the
+  other sees a closed market and exits after one API call.
+- **`concurrency`** guarantees the two never trade the account at once.
+- **State is pushed every cycle**, not at the end. A runner hard-caps a
+  job at 6 hours and the script stops itself at 5.75, but if it were ever
+  killed mid-session, committing only at the end would lose the whole day.
+- **`timeout-minutes: 350`** keeps the job under that ceiling.
+- **Final sync runs `if: always()`** so a crash still commits what it had.
+- The loop exits as soon as Alpaca reports the session over, so it does
+  not idle until the cap.
+
+If a day's trigger is missed entirely, no trading happens that day. Start
+one by hand from the Actions tab, or run `python paper_trader.py` locally.
 
 ## 8. Monitoring
 

@@ -57,6 +57,7 @@
   .side { font-weight:700; font-size:11px; padding:2px 6px; border-radius:4px; }
   .side.buy { background:rgba(63,185,80,.15); color:var(--up); }
   .side.sell { background:rgba(248,81,73,.15); color:var(--down); }
+  .side.hold { background:rgba(139,148,158,.18); color:var(--muted); }
   .why { color:var(--muted); min-width:280px; }
   .empty { color:var(--muted); font-style:italic; }
   footer { color:var(--muted); font-size:12px; border-top:1px solid var(--line);
@@ -81,7 +82,12 @@
   </div>
 
   <div class="card">
-    <h3>Recent decisions</h3>
+    <h3>Last run — every candidate it looked at</h3>
+    <p class="empty">no decisions logged yet — this fills in on the next run</p>
+  </div>
+
+  <div class="card">
+    <h3>Orders placed</h3>
     <div class="scroll"><table>
       <thead><tr><th>When</th><th>Side</th><th>Symbol</th><th>Size</th>
       <th>Fill</th><th>Reasoning</th></tr></thead>

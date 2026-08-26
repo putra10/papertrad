@@ -419,6 +419,20 @@ def run_once():
         print(f"LLM call failed: {e}")
         return
 
+    # Log every decision, not just the ones that became orders. Holds are
+    # most of what the model does, and its reasoning for passing is the
+    # interesting half of the experiment.
+    log_event({
+        "type": "decisions",
+        "candidates": sorted(t for t in market_data if t not in BENCHMARKS),
+        "decisions": [
+            {"ticker": d.get("ticker"),
+             "action": (d.get("action") or "").lower(),
+             "reasoning": (d.get("reasoning") or "").strip()[:400]}
+            for d in decisions.get("decisions", []) if d.get("ticker")
+        ],
+    })
+
     # cash, not margin buying power — fractional orders are non-marginable
     avail = min(float(account["cash"]),
                 float(account.get("non_marginable_buying_power", account["cash"])))

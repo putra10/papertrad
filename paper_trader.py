@@ -305,7 +305,14 @@ def call_llm(prompt):
         timeout=60,
     )
     resp.raise_for_status()
-    return _extract_json(resp.json()["choices"][0]["message"]["content"])
+    choice = resp.json()["choices"][0]
+    # no max_tokens is sent, but models still have their own ceiling; catch a
+    # cut-off reply here so it reads as truncation, not as malformed JSON
+    if choice.get("finish_reason") == "length":
+        raise RuntimeError(
+            "model reply was truncated at its own output limit, so the JSON is "
+            "incomplete. Lower MAX_CANDIDATES or pick a model with more room.")
+    return _extract_json(choice["message"]["content"])
 
 # ----------------------------- ORDERS -------------------------------------
 

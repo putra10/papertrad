@@ -13,8 +13,16 @@ name: paper-trade
 
 on:
   schedule:
-    - cron: "35 13 * * 1-5"
-    - cron: "35 14 * * 1-5"
+    # GitHub drops schedule slots silently and gives no error when it does.
+    # Both slots were dropped on 2026-08-27 and the bot simply did not trade
+    # that day. So ask several times: the first fire that actually lands runs
+    # the session, later ones queue behind `concurrency`, start after it ends,
+    # find the market closed and exit. A dropped slot now costs 30 minutes
+    # instead of the whole day.
+    - cron: "35 13 * * 1-5"   # 09:35 ET during EDT
+    - cron: "5 14 * * 1-5"
+    - cron: "35 14 * * 1-5"   # 09:35 ET during EST, backup during EDT
+    - cron: "5 15 * * 1-5"
   workflow_dispatch:
 
 permissions:
@@ -54,12 +62,17 @@ jobs:
       - name: Final sync
         if: always()              # still commit if the session errored out
         run: |
+          # Every cycle already pushed its own state, so origin is the truth.
+          # Reset to it before rebuilding: a run that was queued behind another
+          # starts from a stale checkout, and committing on that stale base is
+          # what made `git pull --rebase` conflict and fail run #3.
+          git fetch origin main
+          git reset --hard origin/main
           python build_dashboard.py
           git add -A baseline_state.json trade_log.jsonl docs/
           if git diff --staged --quiet; then
             echo "nothing left to commit"
           else
             git commit -m "session end $(date -u '+%Y-%m-%d %H:%M UTC')"
-            git pull --rebase --autostash
             git push
           fi

@@ -88,9 +88,16 @@ def clean(text):
     return (text or "").replace("—", "-").replace("–", "-")
 
 
-def svg_chart(series, width=980, height=300, pad=44):
-    """Multi-line equity chart as inline SVG. Absolute dollars — every
-    series starts from the same equity, so they are directly comparable."""
+def svg_chart(series, height=300, pad=34, foot=24, vbw=1000):
+    """Multi-line equity chart as inline SVG. Absolute dollars, every
+    series starts from the same equity, so they are directly comparable.
+
+    Gridlines and lines live in a nested viewport that is allowed to
+    stretch; the labels stay in the outer one, where they keep their size
+    at any screen width. That is what makes one chart serve a 360px phone
+    and a 1000px desktop: stretch a whole SVG instead and it squashes its
+    own text, scale it uniformly and it collapses to about 100px tall.
+    """
     points = [v for pts in series.values() for _, v in pts]
     if len(points) < 2:
         return ('<p class="empty">Not enough data for a chart yet. Needs at '
@@ -100,32 +107,43 @@ def svg_chart(series, width=980, height=300, pad=44):
     span = (hi - lo) or 1
     lo, hi = lo - span * 0.08, hi + span * 0.08
     span = hi - lo
-    n = max(len(pts) for pts in series.values())
+    top, bottom = pad, height - pad - foot
+    fracs = (0, 0.25, 0.5, 0.75, 1)
+
+    def row(frac):
+        return top + (bottom - top) * frac
 
     def xy(i, v, count):
-        x = pad + (width - pad * 2) * (i / max(count - 1, 1))
-        y = height - pad - (height - pad * 2) * ((v - lo) / span)
+        x = vbw * (i / max(count - 1, 1))
+        y = bottom - (bottom - top) * ((v - lo) / span)
         return f"{x:.1f},{y:.1f}"
 
-    parts = [f'<svg viewBox="0 0 {width} {height}" role="img" '
-             f'aria-label="Equity over time" preserveAspectRatio="none">']
-    # horizontal gridlines + $ labels
-    for frac in (0, 0.25, 0.5, 0.75, 1):
-        y = pad + (height - pad * 2) * frac
-        value = hi - span * frac
-        parts.append(f'<line class="grid" x1="{pad}" y1="{y:.1f}" '
-                     f'x2="{width - pad}" y2="{y:.1f}"/>')
-        parts.append(f'<text class="tick" x="4" y="{y + 4:.1f}">'
-                     f'${value:,.0f}</text>')
+    parts = [f'<svg class="chart" width="100%" height="{height}" role="img" '
+             f'aria-label="Equity over time">',
+             f'<svg width="100%" height="{height}" viewBox="0 0 {vbw} {height}" '
+             f'preserveAspectRatio="none">']
+    for frac in fracs:
+        parts.append(f'<line class="grid" x1="0" y1="{row(frac):.1f}" '
+                     f'x2="{vbw}" y2="{row(frac):.1f}"/>')
     for name, pts in series.items():
         path = " ".join(xy(i, v, len(pts)) for i, (_, v) in enumerate(pts))
         colour = SERIES_COLORS.get(name, "#a371f7")
+        # non-scaling-stroke, or the horizontal stretch thins the lines
         parts.append(f'<polyline points="{path}" fill="none" stroke="{colour}" '
-                     f'stroke-width="2" stroke-linejoin="round"/>')
-    parts.append(f'<text class="tick" x="{pad}" y="{height - 12}">'
-                 f'{when(next(iter(series.values()))[0][0])}</text>')
-    parts.append(f'<text class="tick" x="{width - pad}" y="{height - 12}" '
-                 f'text-anchor="end">{when(next(iter(series.values()))[-1][0])}</text>')
+                     f'stroke-width="2" stroke-linejoin="round" '
+                     f'vector-effect="non-scaling-stroke"/>')
+    parts.append("</svg>")
+
+    # labels sit just above their gridline, so no left gutter is needed and
+    # the lines get the full width on a narrow screen
+    for frac in fracs:
+        parts.append(f'<text class="tick" x="2" y="{row(frac) - 5:.1f}">'
+                     f'${hi - span * frac:,.0f}</text>')
+    stamps = next(iter(series.values()))
+    parts.append(f'<text class="tick" x="2" y="{height - 6}">'
+                 f'{when(stamps[0][0])}</text>')
+    parts.append(f'<text class="tick" x="100%" dx="-2" y="{height - 6}" '
+                 f'text-anchor="end">{when(stamps[-1][0])}</text>')
     parts.append("</svg>")
     return "".join(parts)
 
@@ -169,11 +187,11 @@ def render(events, demo=False):
         prows = "".join(
             f'<tr><td class="sym">{sym}</td>'
             f'<td class="num">{float(p.get("shares") or 0):,.4f}</td>'
-            f'<td class="num">{fmt_money(float(p.get("avg_entry") or 0))}</td>'
-            f'<td class="num">{fmt_money(float(p.get("last") or 0))}</td>'
+            f'<td class="num opt">{fmt_money(float(p.get("avg_entry") or 0))}</td>'
+            f'<td class="num opt">{fmt_money(float(p.get("last") or 0))}</td>'
             f'<td class="num">{fmt_money(float(p.get("value") or 0))}</td>'
             f'<td class="num {cls(float(p.get("pl") or 0))}">'
-            f'{fmt_delta(float(p.get("pl") or 0))} '
+            f'<span class="opt">{fmt_delta(float(p.get("pl") or 0))} </span>'
             f'({float(p.get("pl_pct") or 0):+.2f}%)</td></tr>'
             for sym, p in sorted(positions.items()))
         cash_row = ""
@@ -182,11 +200,12 @@ def render(events, demo=False):
             cash_row = (f'<tr><td class="sym">CASH</td>'
                         f'<td colspan="3" class="empty">uninvested</td>'
                         f'<td class="num">{fmt_money(float(cash))}</td>'
-                        f'<td class="num empty">{pct:.1f}% of equity</td></tr>')
+                        f'<td class="num empty">{pct:.1f}%'
+                        f'<span class="opt"> of equity</span></td></tr>')
         held_html = (
             '<div class="scroll"><table><thead><tr><th>Symbol</th>'
-            '<th class="num">Shares</th><th class="num">Avg entry</th>'
-            '<th class="num">Last</th><th class="num">Value</th>'
+            '<th class="num">Shares</th><th class="num opt">Avg entry</th>'
+            '<th class="num opt">Last</th><th class="num">Value</th>'
             '<th class="num">Unrealized</th></tr></thead>'
             f'<tbody>{prows}{cash_row}</tbody></table></div>')
     elif latest.get("held"):
@@ -324,7 +343,7 @@ def render(events, demo=False):
     border-radius:10px; padding:16px; margin-bottom:22px; }}
   .card h3 {{ font-size:13px; text-transform:uppercase; letter-spacing:.05em;
     color:var(--muted); margin:0 0 12px; font-weight:600; }}
-  svg {{ width:100%; height:300px; display:block; }}
+  svg {{ display:block; }}
   .grid {{ stroke:var(--line); stroke-width:1; }}
   .tick {{ fill:var(--muted); font-size:11px; }}
   .key {{ display:inline-flex; align-items:center; gap:6px; margin-right:14px;
@@ -334,7 +353,7 @@ def render(events, demo=False):
     flex-wrap:wrap; gap:8px; }}
   ul.held li {{ background:var(--bg); border:1px solid var(--line);
     border-radius:6px; padding:4px 10px; font-weight:600; font-size:14px; }}
-  .scroll {{ overflow-x:auto; }}
+  .scroll {{ overflow-x:auto; -webkit-overflow-scrolling:touch; }}
   table {{ border-collapse:collapse; width:100%; font-size:13px; }}
   th {{ text-align:left; color:var(--muted); font-size:11px;
     text-transform:uppercase; letter-spacing:.05em; padding:0 10px 8px 0; }}
@@ -362,8 +381,24 @@ def render(events, demo=False):
   pre {{ background:var(--bg); border:1px solid var(--line); border-radius:6px;
     padding:12px; overflow-x:auto; font-size:12px; line-height:1.45;
     white-space:pre-wrap; word-break:break-word; margin:6px 0 0; }}
-  footer {{ color:var(--muted); font-size:12px; border-top:1px solid var(--line);
-    padding-top:14px; }}
+  @media (max-width:640px) {{
+    body {{ padding:14px; }}
+    h1 {{ font-size:18px; }}
+    .stamp {{ margin-bottom:16px; }}
+    /* 140px lets two tiles sit side by side on a phone instead of five
+       full-width slabs the reader has to scroll past to reach the chart */
+    .tiles {{ gap:10px; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); }}
+    .value {{ font-size:20px; }}
+    .card {{ padding:12px; margin-bottom:16px; }}
+    table {{ font-size:12px; }}
+    td, th {{ padding-right:8px; }}
+    .num {{ padding-right:8px; }}
+    .opt {{ display:none; }}
+    /* let reasoning wrap into a readable column instead of forcing the
+       whole table sideways; the .scroll wrapper still catches the rest */
+    .why {{ min-width:150px; }}
+    pre {{ font-size:11px; }}
+  }}
 </style>
 <div class="wrap">
   {banner}
@@ -399,9 +434,6 @@ def render(events, demo=False):
     </table></div>
   </div>
 
-  <footer>Simulated trading only. No real money is involved. Swing / mid-term
-  horizon: positions are meant to be held for days to weeks. The bot beating
-  or losing to a benchmark over days means nothing; judge it over months.</footer>
 </div>
 """
 
@@ -475,6 +507,11 @@ def selfcheck():
     empty = render([])
     assert "no orders yet" in empty and "Not enough data" in empty
     page = render(demo_events(), demo=True)
+    # one chart, drawn once: lines in a stretching nested viewport, labels
+    # outside it so they keep their size at any width
+    assert page.count("<polyline") == 3, "expected one line per series"
+    assert page.count("<svg") == 2 and 'preserveAspectRatio="none"' in page
+    assert 'x="100%"' in page and "@media (max-width:640px)" in page
     for must in ("DEMO DATA", "vs SPY", "vs QQQ", "<polyline", "NVDA",
                  "candidates", "HOLD", "every candidate it looked at",
                  "Raw model response", "Model thinking", "1840 in / 412 out",

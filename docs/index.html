@@ -36,7 +36,7 @@
     border-radius:10px; padding:16px; margin-bottom:22px; }
   .card h3 { font-size:13px; text-transform:uppercase; letter-spacing:.05em;
     color:var(--muted); margin:0 0 12px; font-weight:600; }
-  svg { width:100%; height:300px; display:block; }
+  svg { display:block; }
   .grid { stroke:var(--line); stroke-width:1; }
   .tick { fill:var(--muted); font-size:11px; }
   .key { display:inline-flex; align-items:center; gap:6px; margin-right:14px;
@@ -46,7 +46,7 @@
     flex-wrap:wrap; gap:8px; }
   ul.held li { background:var(--bg); border:1px solid var(--line);
     border-radius:6px; padding:4px 10px; font-weight:600; font-size:14px; }
-  .scroll { overflow-x:auto; }
+  .scroll { overflow-x:auto; -webkit-overflow-scrolling:touch; }
   table { border-collapse:collapse; width:100%; font-size:13px; }
   th { text-align:left; color:var(--muted); font-size:11px;
     text-transform:uppercase; letter-spacing:.05em; padding:0 10px 8px 0; }
@@ -74,8 +74,24 @@
   pre { background:var(--bg); border:1px solid var(--line); border-radius:6px;
     padding:12px; overflow-x:auto; font-size:12px; line-height:1.45;
     white-space:pre-wrap; word-break:break-word; margin:6px 0 0; }
-  footer { color:var(--muted); font-size:12px; border-top:1px solid var(--line);
-    padding-top:14px; }
+  @media (max-width:640px) {
+    body { padding:14px; }
+    h1 { font-size:18px; }
+    .stamp { margin-bottom:16px; }
+    /* 140px lets two tiles sit side by side on a phone instead of five
+       full-width slabs the reader has to scroll past to reach the chart */
+    .tiles { gap:10px; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); }
+    .value { font-size:20px; }
+    .card { padding:12px; margin-bottom:16px; }
+    table { font-size:12px; }
+    td, th { padding-right:8px; }
+    .num { padding-right:8px; }
+    .opt { display:none; }
+    /* let reasoning wrap into a readable column instead of forcing the
+       whole table sideways; the .scroll wrapper still catches the rest */
+    .why { min-width:150px; }
+    pre { font-size:11px; }
+  }
 </style>
 <div class="wrap">
   
@@ -88,7 +104,7 @@
 
   <div class="card">
     <h3>Equity vs benchmarks</h3>
-    <svg viewBox="0 0 980 300" role="img" aria-label="Equity over time" preserveAspectRatio="none"><line class="grid" x1="44" y1="44.0" x2="936" y2="44.0"/><text class="tick" x="4" y="48.0">$101,920</text><line class="grid" x1="44" y1="97.0" x2="936" y2="97.0"/><text class="tick" x="4" y="101.0">$101,101</text><line class="grid" x1="44" y1="150.0" x2="936" y2="150.0"/><text class="tick" x="4" y="154.0">$100,282</text><line class="grid" x1="44" y1="203.0" x2="936" y2="203.0"/><text class="tick" x="4" y="207.0">$99,462</text><line class="grid" x1="44" y1="256.0" x2="936" y2="256.0"/><text class="tick" x="4" y="260.0">$98,643</text><polyline points="44.0,168.2 96.5,168.2 148.9,168.4 201.4,87.6 253.9,88.3 306.4,87.4 358.8,92.1 411.3,114.4 463.8,120.4 516.2,120.8 568.7,103.8 621.2,97.0 673.6,95.8 726.1,170.7 778.6,192.0 831.1,183.2 883.5,224.4 936.0,241.4" fill="none" stroke="#2f81f7" stroke-width="2" stroke-linejoin="round"/><polyline points="44.0,168.2 96.5,160.7 148.9,160.2 201.4,125.7 253.9,117.5 306.4,115.1 358.8,117.0 411.3,122.4 463.8,133.2 516.2,138.5 568.7,139.5 621.2,132.6 673.6,128.4 726.1,95.5 778.6,99.0 831.1,92.6 883.5,109.4 936.0,128.2" fill="none" stroke="#8b949e" stroke-width="2" stroke-linejoin="round"/><polyline points="44.0,168.2 96.5,159.9 148.9,162.8 201.4,98.9 253.9,88.5 306.4,85.6 358.8,88.5 411.3,95.9 463.8,105.6 516.2,112.2 568.7,109.2 621.2,97.8 673.6,91.1 726.1,60.1 778.6,62.7 831.1,58.6 883.5,80.9 936.0,115.0" fill="none" stroke="#d29922" stroke-width="2" stroke-linejoin="round"/><text class="tick" x="44" y="288">27 Aug 01:47 WIB</text><text class="tick" x="936" y="288" text-anchor="end">28 Aug 23:04 WIB</text></svg>
+    <svg class="chart" width="100%" height="300" role="img" aria-label="Equity over time"><svg width="100%" height="300" viewBox="0 0 1000 300" preserveAspectRatio="none"><line class="grid" x1="0" y1="34.0" x2="1000" y2="34.0"/><line class="grid" x1="0" y1="86.0" x2="1000" y2="86.0"/><line class="grid" x1="0" y1="138.0" x2="1000" y2="138.0"/><line class="grid" x1="0" y1="190.0" x2="1000" y2="190.0"/><line class="grid" x1="0" y1="242.0" x2="1000" y2="242.0"/><polyline points="0.0,155.9 58.8,155.9 117.6,156.1 176.5,76.8 235.3,77.4 294.1,76.6 352.9,81.2 411.8,103.0 470.6,109.0 529.4,109.3 588.2,92.7 647.1,86.0 705.9,84.8 764.7,158.4 823.5,179.2 882.4,170.6 941.2,211.0 1000.0,227.7" fill="none" stroke="#2f81f7" stroke-width="2" stroke-linejoin="round" vector-effect="non-scaling-stroke"/><polyline points="0.0,155.9 58.8,148.5 117.6,148.0 176.5,114.1 235.3,106.1 294.1,103.8 352.9,105.6 411.8,110.9 470.6,121.5 529.4,126.7 588.2,127.7 647.1,120.9 705.9,116.8 764.7,84.5 823.5,87.9 882.4,81.7 941.2,98.1 1000.0,116.6" fill="none" stroke="#8b949e" stroke-width="2" stroke-linejoin="round" vector-effect="non-scaling-stroke"/><polyline points="0.0,155.9 58.8,147.7 117.6,150.5 176.5,87.9 235.3,77.6 294.1,74.8 352.9,77.7 411.8,84.9 470.6,94.4 529.4,100.9 588.2,98.0 647.1,86.8 705.9,80.2 764.7,49.8 823.5,52.4 882.4,48.3 941.2,70.2 1000.0,103.7" fill="none" stroke="#d29922" stroke-width="2" stroke-linejoin="round" vector-effect="non-scaling-stroke"/></svg><text class="tick" x="2" y="29.0">$101,920</text><text class="tick" x="2" y="81.0">$101,101</text><text class="tick" x="2" y="133.0">$100,282</text><text class="tick" x="2" y="185.0">$99,462</text><text class="tick" x="2" y="237.0">$98,643</text><text class="tick" x="2" y="294">27 Aug 01:47 WIB</text><text class="tick" x="100%" dx="-2" y="294" text-anchor="end">28 Aug 23:04 WIB</text></svg>
     <div><span class="key"><i style="background:#2f81f7"></i>Bot</span><span class="key"><i style="background:#8b949e"></i>SPY</span><span class="key"><i style="background:#d29922"></i>QQQ</span></div>
   </div>
 
@@ -149,7 +165,4 @@
     </table></div>
   </div>
 
-  <footer>Simulated trading only. No real money is involved. Swing / mid-term
-  horizon: positions are meant to be held for days to weeks. The bot beating
-  or losing to a benchmark over days means nothing; judge it over months.</footer>
 </div>

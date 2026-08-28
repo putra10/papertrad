@@ -1,7 +1,12 @@
 # LLM Paper Trading Bot — Alpaca free tier
 
-Simulated (fake money) intraday trading experiment using an LLM via
-OpenRouter and an **Alpaca paper trading account**. No real money, no
+Simulated (fake money) **swing / mid-term** trading experiment using an LLM
+via OpenRouter and an **Alpaca paper trading account**. Positions are meant
+to be carried for days to weeks, not scalped, so the model is fed about a
+month of daily closes and the last few days of headlines alongside the live
+tape. It also knows what day it is: Alpaca's calendar tells it whether today
+is a trading day, a weekend, or a market holiday, and whether holding
+overnight means holding across a long weekend. No real money, no
 funding required — Alpaca's paper account and IEX market data are both
 free. Runs fine on a normal laptop; it's just API calls.
 
@@ -113,12 +118,22 @@ At ~36 runs/day this matters. Nothing sensitive is committed — see below.
 
 The workflow is [.github/workflows/trade.yml](.github/workflows/trade.yml).
 
-**It fires once per session, not every 15 minutes.** That is deliberate.
+**Set it up once and it runs itself.** Nothing needs to be started by hand
+on a trading day.
+
+**It fires once per session, not on every cycle.** That is deliberate.
 GitHub's scheduler is unreliable at short intervals: a `*/15` cron runs
 late and silently drops slots, and asking it for 36 fires a day gives it
 36 chances to fail. Instead it fires once, and `paper_trader.py --session`
-holds the 15-minute cadence itself with real sleeps. The cadence becomes
-exact; only the start time is at GitHub's mercy.
+holds the cadence itself with real sleeps. The cadence becomes exact; only
+the start time is at GitHub's mercy.
+
+**The cadence is hourly (`--session 60`).** Re-deciding four times an hour
+churns positions the model is supposed to be carrying for days.
+
+**Holidays need no cron rule.** The crons cover Mon-Fri; on Thanksgiving or
+Labor Day the script asks Alpaca's clock and calendar, prints why the market
+is closed, and exits after two API calls.
 
 This costs about 6 hours of runner time per day. On a **public** repo that
 is free and unlimited, which is the whole reason the repo is public. If
@@ -177,7 +192,8 @@ The single number that matters is the bot's equity against QQQ over
 python paper_trader.py --loop 15
 ```
 
-Polls every 15 minutes. US market hours are 9:30am–4:00pm ET, roughly
+Polls every 15 minutes (CI uses `--session 60`, which also exits on its own
+at the close). US market hours are 9:30am–4:00pm ET, roughly
 8:30pm–3:00am WIB (Indonesia time) — late nights if you babysit it, so a
 scheduler is usually nicer. Off-hours runs cost one cheap clock call and
 exit, so leaving the loop running overnight is harmless.
@@ -292,9 +308,11 @@ time** — swapping models mid-experiment resets your evidence.
 
 ## Notes on cost
 
-Each run = one LLM API call. Every 15 min for ~6.5 hours of market time is
-~26 calls/day. On the default model that's cents per month; on a free slug
-it's nothing. Alpaca itself costs nothing here.
+Each run = one LLM API call. Hourly across ~6.5 hours of market time is
+~7 calls/day. No output or thinking cap is sent, so a reasoning model will
+use its full budget and those calls are not tiny; on the default model
+that is still cents per month, and on a free slug it is nothing. Alpaca
+itself costs nothing here, news endpoint included.
 
 ## Important honesty check
 

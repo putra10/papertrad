@@ -1,20 +1,31 @@
 """
-LLM Paper Trading Bot — Alpaca free tier (Intraday, US Stocks)
+LLM Paper Trading Bot — Alpaca free tier (Swing / mid-term, US Stocks)
 ==============================================================
 Simulates trading decisions using an LLM (via OpenRouter) against a real
 Alpaca PAPER account. Fake money, real order plumbing, real market data.
 
 HOW IT WORKS
 ------------
-1. Checks Alpaca's clock — skips the run if the market is closed.
+1. Checks Alpaca's clock AND calendar, so it knows whether today is a
+   trading day, a weekend, or a market holiday, and how long until the
+   next session. It skips the run when the market is closed.
 2. Builds a candidate pool from Alpaca's screener: today's most-active
    names + biggest movers, plus whatever the account already holds.
-3. Pulls snapshots + recent intraday bars for those (free IEX feed).
-4. Sends that data + your paper account state to an LLM on OpenRouter.
+3. Pulls snapshots, ~20 daily closes (the swing signal), recent intraday
+   bars, and the last few days of headlines for those names (free IEX feed
+   plus Alpaca's news API).
+4. Sends that data + your paper account state (shares, entry, days held,
+   cash) to an LLM on OpenRouter. No output or thinking cap is imposed.
 5. THE LLM PICKS the tickers and returns buy / sell / hold per name.
 6. Submits the orders to the PAPER endpoint and waits for the fill,
    so the real execution price lands in the log (no real money).
 7. Tracks SPY and QQQ buy-and-hold baselines for honest comparison.
+
+The horizon is SWING / MID-TERM: positions are meant to be carried for days
+to weeks, across nights and weekends, not scalped intraday.
+
+.github/workflows/trade.yml runs this on GitHub Actions every weekday and
+commits the state and dashboard back, so nothing has to be run by hand.
 
 SETUP
 -----
@@ -46,7 +57,7 @@ import math
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -64,7 +75,17 @@ MAX_PER_NAME_PCT = 25      # and the most it should put in any single name
 BENCHMARKS = ["SPY", "QQQ"]  # buy & hold comparisons, tracked separately
 
 BAR_TIMEFRAME = "5Min"                 # 1Min, 5Min, 15Min, 1Hour...
-BARS_SHOWN = 6                         # recent bars sent to the LLM
+BARS_SHOWN = 6                         # recent intraday bars sent to the LLM
+
+# This portfolio is SWING / MID-TERM: positions are meant to be carried for
+# days to weeks, so the model needs more than today's tape. Daily closes give
+# it the multi-week shape, and news moves a multi-day horizon far more than a
+# 5-minute bar does.
+DAILY_BARS_SHOWN = 20                  # ~1 month of daily closes per name
+DAILY_LOOKBACK_DAYS = 45               # calendar days pulled to fill them
+HOLD_DAYS_TARGET = "3 to 15 trading days"
+NEWS_LOOKBACK_DAYS = 5
+NEWS_LIMIT = 40
 
 # OpenRouter model, $/M tokens in/out as of 2026-08. The script does the
 # trading; the model only has to return the JSON, so cheap is fine.
@@ -139,15 +160,109 @@ def get_account():
 
 
 def get_positions():
-    """ticker -> {qty (exact string from API), qty_f, avg_entry, unrealized_plpc}"""
+    """ticker -> full position detail. `qty` stays the API's exact string."""
     out = {}
     for p in _api("GET", TRADE_URL, "/v2/positions"):
         out[p["symbol"]] = {
             "qty": p["qty"],
             "qty_f": float(p["qty"]),
             "avg_entry": round(float(p["avg_entry_price"]), 2),
+            "current_price": round(float(p.get("current_price") or 0), 2),
+            "market_value": round(float(p.get("market_value") or 0), 2),
+            "cost_basis": round(float(p.get("cost_basis") or 0), 2),
+            "unrealized_pl": round(float(p.get("unrealized_pl") or 0), 2),
             "unrealized_plpc": round(float(p["unrealized_plpc"]) * 100, 2),
         }
+    return out
+
+
+def get_calendar(start, end):
+    return _api("GET", TRADE_URL, "/v2/calendar",
+                params={"start": str(start), "end": str(end)})
+
+
+def day_context(clock):
+    """What day is it, is the market open, and why not if it is closed.
+
+    Alpaca's calendar already knows every US market holiday and half day, so
+    weekend / holiday / after-hours never has to be guessed from a weekday
+    number. The model gets this too: holding over a 3-day weekend is a
+    different decision from holding over one night.
+    """
+    now = datetime.fromisoformat(clock["timestamp"])
+    today = now.date()
+    try:
+        cal = get_calendar(today - timedelta(days=5), today + timedelta(days=12))
+    except Exception as e:
+        print(f"  [warn] calendar failed: {e}")
+        cal = []
+    sessions = [c["date"] for c in cal]
+    is_trading_day = str(today) in sessions
+    later = [d for d in sessions if d > str(today)]
+    next_day = later[0] if later else None
+    gap = (date.fromisoformat(next_day) - today).days if next_day else None
+
+    if clock["is_open"]:
+        mins_left = round(
+            (datetime.fromisoformat(clock["next_close"]) - now).total_seconds() / 60)
+        why = f"open, {mins_left} min to the close"
+    else:
+        mins_left = None
+        if not is_trading_day:
+            why = "weekend" if today.weekday() >= 5 else "market holiday"
+        else:
+            why = "outside regular hours"
+
+    return {
+        "date": str(today),
+        "weekday": now.strftime("%A"),
+        "market_open": clock["is_open"],
+        "status": why,
+        "minutes_to_close": mins_left,
+        "next_open": clock.get("next_open"),
+        "next_trading_day": next_day,
+        # >1 means the next session is not tomorrow: a weekend or a holiday
+        # sits in between, so anything held now is held across it.
+        "days_until_next_session": gap,
+        "summary": (f"{now:%a %d %b %Y %H:%M} ET - {why}"
+                    + (f"; next session {next_day}" if next_day else "")),
+    }
+
+
+def holding_days(symbols):
+    """symbol -> days since the buy that opened the position, from our log.
+
+    Alpaca exposes no entry date on a position, so it is read back out of
+    trade_log.jsonl. A swing bot needs to know it has been sitting in
+    something for two weeks; None just means the log does not go back far
+    enough.
+    """
+    # ponytail: any sell restarts the clock, even a partial trim. Track
+    # per-lot entries only if partial exits ever become common.
+    opened = {}
+    if not LOG_FILE.exists():
+        return {}
+    for line in LOG_FILE.read_text(encoding="utf-8").splitlines():
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if e.get("type") != "order":
+            continue
+        sym = (e.get("order") or {}).get("symbol")
+        if sym not in symbols:
+            continue
+        if (e.get("order") or {}).get("side") == "sell":
+            opened.pop(sym, None)
+        else:
+            opened.setdefault(sym, e.get("timestamp"))
+    now = datetime.now(timezone.utc)
+    out = {}
+    for sym, ts in opened.items():
+        try:
+            out[sym] = round((now - datetime.fromisoformat(ts)).total_seconds() / 86400, 1)
+        except (TypeError, ValueError):
+            continue
     return out
 
 
@@ -209,7 +324,7 @@ def fetch_candidates(held):
 
 
 def fetch_market_data(tickers, session_date):
-    """Snapshots (price / day open) + recent bars (shape), free IEX feed."""
+    """Snapshots + intraday bars (today) + daily bars (the swing picture)."""
     syms = ",".join(tickers)
     raw = _api("GET", DATA_URL, "/v2/stocks/snapshots",
                params={"symbols": syms, "feed": FEED})
@@ -218,6 +333,19 @@ def fetch_market_data(tickers, session_date):
                 params={"symbols": syms, "timeframe": BAR_TIMEFRAME,
                         "start": session_date, "feed": FEED,
                         "limit": 10000}).get("bars") or {}
+    # A mid-term call cannot be made off six 5-minute bars, so pull about a
+    # month of daily closes as well. Non-fatal: a run on intraday data alone
+    # still beats no run.
+    day_start = (date.fromisoformat(session_date)
+                 - timedelta(days=DAILY_LOOKBACK_DAYS)).isoformat()
+    try:
+        dailies = _api("GET", DATA_URL, "/v2/stocks/bars",
+                       params={"symbols": syms, "timeframe": "1Day",
+                               "start": day_start, "feed": FEED,
+                               "limit": 10000}).get("bars") or {}
+    except Exception as e:
+        print(f"  [warn] daily bars failed: {e}")
+        dailies = {}
 
     data = {}
     for t in tickers:
@@ -230,54 +358,146 @@ def fetch_market_data(tickers, session_date):
                 or (s.get("minuteBar") or {}).get("c") or daily.get("c"))
         day_open = daily.get("o")
         prev_close = (s.get("prevDailyBar") or {}).get("c")
+        full = [round(b["c"], 2) for b in dailies.get(t, [])]
+        closes = full[-DAILY_BARS_SHOWN:]
+
+        def back(n, _c=full, _last=last):
+            """% move vs n daily bars ago; None when history is that short.
+
+            Reads the whole pulled series, not the shown slice, so a 20-day
+            comparison is not asking a 20-long list for its 20th-from-last.
+            """
+            return (round((_last - _c[-n]) / _c[-n] * 100, 2)
+                    if len(_c) > n else None)
+
         data[t] = {
             "last_price": round(float(last), 2),
             "day_open": round(float(day_open), 2),
             "prev_close": round(float(prev_close), 2) if prev_close else None,
             "pct_change_today": round((last - day_open) / day_open * 100, 2),
+            "pct_change_5d": back(5),
+            "pct_change_20d": back(20),
+            "high_20d": max(closes) if closes else None,
+            "low_20d": min(closes) if closes else None,
+            "daily_closes": closes,
             "recent_closes": [round(b["c"], 2) for b in bars.get(t, [])[-BARS_SHOWN:]],
         }
     return data
 
+
+def fetch_news(tickers, days=NEWS_LOOKBACK_DAYS):
+    """Recent headlines for the pool, from Alpaca's news API.
+
+    Same keys, same host, no extra dependency and no extra secret, which is
+    why this and not yfinance or a pile of RSS feeds. Non-fatal on failure:
+    the run falls back to price data alone.
+    """
+    start = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+    try:
+        items = _api("GET", DATA_URL, "/v1beta1/news",
+                     params={"symbols": ",".join(tickers), "start": start,
+                             "limit": NEWS_LIMIT, "sort": "desc",
+                             "include_content": "false"}).get("news") or []
+    except Exception as e:
+        print(f"  [warn] news fetch failed: {e}")
+        return []
+    pool = set(tickers)
+    return [{"when": (n.get("created_at") or "")[:10],
+             "symbols": [x for x in (n.get("symbols") or []) if x in pool],
+             "headline": (n.get("headline") or "").strip(),
+             "summary": (n.get("summary") or "").strip()[:300],
+             "source": n.get("source") or ""}
+            for n in items if n.get("headline")]
+
 # ----------------------------- LLM ---------------------------------------
 
-def build_prompt(market_data, account, positions):
+def format_news(news):
+    lines = []
+    for n in news:
+        tag = ", ".join(n["symbols"]) or "market"
+        head = f"- [{n['when']}] {tag}: {n['headline']}"
+        if n["source"]:
+            head += f" ({n['source']})"
+        if n["summary"]:
+            head += f"\n    {n['summary']}"
+        lines.append(head)
+    return "\n".join(lines) or "(no headlines for these names)"
+
+
+def build_prompt(market_data, account, positions, day, news, held_days):
+    holdings = {
+        t: {"shares": round(p["qty_f"], 6),
+            "avg_entry": p["avg_entry"],
+            "last_price": p["current_price"],
+            "market_value": p["market_value"],
+            "unrealized_pl": p["unrealized_pl"],
+            "unrealized_pct": p["unrealized_plpc"],
+            "days_held": held_days.get(t)}
+        for t, p in positions.items()
+    }
+    carry = day.get("days_until_next_session")
+    carry_note = ("The next session is TOMORROW."
+                  if carry == 1 else
+                  f"The next session is {day.get('next_trading_day')}, "
+                  f"{carry} days away, so anything held now is held across a "
+                  f"weekend or market holiday with no chance to react."
+                  if carry else "Next session date unknown.")
+
     return f"""You are a trading research assistant running a SIMULATED
 (Alpaca paper trading, no real money) portfolio experiment. Analyze the
 data below and return a decision for each ticker.
 
-Account equity: ${float(account['equity']):.2f}
-Available cash: ${float(account['cash']):.2f}
-Current positions: {json.dumps(positions, indent=2)}
+TIME HORIZON: this is a SWING / MID-TERM portfolio, not a day-trading one.
+You are holding for {HOLD_DAYS_TARGET} - days to weeks, not minutes. Judge
+a name on its multi-day trend, its position in the 20-day range, and its
+news, not on the last few 5-minute bars. Intraday noise is not a reason to
+trade. Positions carry over between runs and across nights and weekends.
 
-Candidates (today's most-active names and biggest movers, Alpaca IEX feed,
-{BAR_TIMEFRAME} bars). {" and ".join(BENCHMARKS)} are included as market
-references — you may trade them like anything else:
+TODAY: {day['weekday']} {day['date']}, market is {day['status']}.
+{carry_note}
+
+Account equity: ${float(account['equity']):.2f}
+Cash on hand:   ${float(account['cash']):.2f}
+Current positions (shares, entry, and how long they have been held):
+{json.dumps(holdings, indent=2)}
+
+Candidates (today's most-active names and biggest movers, Alpaca IEX feed).
+`daily_closes` is the last {DAILY_BARS_SHOWN} daily closes (oldest first) -
+that is your swing signal. `recent_closes` is today's {BAR_TIMEFRAME} bars,
+context only. {" and ".join(BENCHMARKS)} are included as market references -
+you may trade them like anything else:
 {json.dumps(market_data, indent=2)}
 
-YOU choose which of these to trade, and this is an ACTIVE intraday
-experiment. Cash sitting idle earns nothing and generates no data to learn
-from, so bias toward taking positions.
+RECENT NEWS for these names (last {NEWS_LOOKBACK_DAYS} days, newest first).
+Weigh this: over a multi-day horizon, a catalyst or a guidance cut matters
+more than the chart. Say in your reasoning when a headline drove the call:
+{format_news(news)}
+
+YOU choose which of these to trade. This is an ACTIVE experiment: cash
+sitting idle earns nothing and generates no data, so bias toward holding
+real positions - but "active" means committed, not twitchy.
 
 - Aim to keep roughly {TARGET_DEPLOYED_PCT}% of total equity deployed,
   spread across about 2 to 5 names.
-- Act whenever the data gives you a defensible reason. You do not need high
-  conviction or a textbook setup; a modest edge is enough.
-- Hold a name only when it genuinely offers nothing to act on. Do not
-  return all holds as a default.
-- If you are already near the target deployment, rotate: sell what looks
-  weakest and buy what looks strongest, rather than sitting still.
+- Open a position when the multi-day trend and the news agree. A modest
+  edge is enough; you do not need a textbook setup.
+- Once you own something, give the thesis room to work. Do not sell a
+  position that is a day or two old just because it moved against you
+  slightly. Sell when the thesis breaks, the news turns, or it has run.
+- If you are already near the target deployment, rotate: sell the weakest
+  thesis and buy a stronger one, rather than adding on top.
 
 For each ticker you want to act on, give: buy, sell, or hold.
 - If buy: specify dollar amount to allocate (must not exceed available cash
   across all buys combined; minimum ${MIN_NOTIONAL:.2f} per order).
 - If sell: specify number of shares to sell (must not exceed current holding).
 - Include every ticker you currently hold, so each position gets a decision.
-- Keep any single position under about {MAX_PER_NAME_PCT}% of equity. You
-  carry positions into future runs and there are no stop losses.
+- Keep any single position under about {MAX_PER_NAME_PCT}% of equity. There
+  are no stop losses, so size as if you cannot watch it.
 - Always give brief reasoning (1-2 sentences) grounded in the data provided.
 - Do not invent information not present in the data above. The candidate
-  list changes every run; you have no memory of previous runs.
+  list changes every run; your positions and their ages above are the only
+  memory you have of previous runs.
 
 Respond with ONLY valid JSON, no markdown fences, no commentary outside the
 JSON, in this exact structure:
@@ -297,7 +517,15 @@ def _extract_json(content):
     return json.loads(content[start:end + 1])
 
 
-def call_llm(prompt):
+def call_llm(prompt, effort="high"):
+    """One OpenRouter call. No output ceiling is sent, on purpose.
+
+    Omitting max_tokens lets the model use its own full completion budget,
+    and reasoning effort "high" lets it think as long as it wants. The one
+    exception is the retry below: a model that blew its OWN ceiling mid-JSON
+    gets one more pass at lower effort, because a shorter answer beats
+    losing the run. That is a fallback, not a cap.
+    """
     if not OPENROUTER_API_KEY:
         raise RuntimeError(
             "OPENROUTER_API_KEY environment variable not set. "
@@ -316,27 +544,32 @@ def call_llm(prompt):
             # route to whichever host serves this model cheapest
             "provider": {"sort": "price"},
             # models that support thinking will use it; the rest ignore this
-            "reasoning": {"effort": "high"},
+            "reasoning": {"effort": effort},
         },
-        timeout=120,
+        timeout=600,
     )
     resp.raise_for_status()
-    choice = resp.json()["choices"][0]
-    # no max_tokens is sent, but models still have their own ceiling; catch a
-    # cut-off reply here so it reads as truncation, not as malformed JSON
+    body = resp.json()
+    choice = body["choices"][0]
+    content = choice["message"].get("content") or ""
     if choice.get("finish_reason") == "length":
+        if effort == "high":
+            print("  [warn] model hit its own output ceiling; retrying at "
+                  "medium reasoning effort")
+            return call_llm(prompt, effort="medium")
         raise RuntimeError(
             "model reply was truncated at its own output limit, so the JSON is "
             "incomplete. Lower MAX_CANDIDATES or pick a model with more room.")
-    body = resp.json()
-    content = choice["message"]["content"]
     meta = {
         "model": body.get("model") or MODEL,
-        "raw": (content or "")[:4000],
-        "thinking": (choice["message"].get("reasoning") or "")[:4000],
+        # stored in full: the whole point of the log is reading what it thought
+        "raw": content,
+        "thinking": choice["message"].get("reasoning") or "",
         "usage": body.get("usage") or {},
+        "effort": effort,
     }
     return _extract_json(content), meta
+
 
 # ----------------------------- ORDERS -------------------------------------
 
@@ -418,8 +651,10 @@ def baseline_values(state, market_data):
 def run_once():
     print(f"\n=== Run at {datetime.now(timezone.utc).isoformat()} ===")
     clock = get_clock()
+    day = day_context(clock)
+    print(f"  {day['summary']}")
     if not clock["is_open"]:
-        print(f"Market closed. Next open: {clock['next_open']}.")
+        print(f"Market closed ({day['status']}). Next open: {clock['next_open']}.")
         return False
 
     account = get_account()
@@ -437,8 +672,12 @@ def run_once():
 
     baseline = load_baseline(market_data, float(account["equity"]))
 
+    news = fetch_news(list(market_data))
+    print(f"  news headlines: {len(news)}")
+
     try:
-        decisions, meta = call_llm(build_prompt(market_data, account, positions))
+        decisions, meta = call_llm(build_prompt(
+            market_data, account, positions, day, news, holding_days(positions)))
     except Exception as e:
         print(f"LLM call failed: {e}")
         # logged, not just printed, so the dashboard can show what broke
@@ -454,6 +693,9 @@ def run_once():
         "raw": meta["raw"],
         "thinking": meta["thinking"],
         "usage": meta["usage"],
+        "effort": meta["effort"],
+        "day": day,
+        "news": news,
         "candidates": sorted(t for t in market_data if t not in BENCHMARKS),
         "decisions": [
             {"ticker": d.get("ticker"),
@@ -487,15 +729,30 @@ def run_once():
             print(f"  [warn] order failed {order}: {e}")
             log_event({"type": "order_failed", "order": order, "error": str(e)})
 
-    # re-read the account after fills, else the comparison lags a run behind
-    bot_value = float((get_account() if orders else account)["equity"])
+    # re-read account AND positions after fills, else the dashboard shows the
+    # portfolio as it was before this run traded it
+    if orders:
+        account, positions = get_account(), get_positions()
+    bot_value = float(account["equity"])
+    cash = float(account["cash"])
     bases = baseline_values(baseline, market_data)
-    print(f"Bot equity:               ${bot_value:.2f}")
+    print(f"Bot equity:               ${bot_value:.2f}  (cash ${cash:,.2f})")
+    for sym, pos in sorted(positions.items()):
+        print(f"    {sym:<6} {pos['qty_f']:>10.4f} sh @ ${pos['avg_entry']:>8.2f}"
+              f"  now ${pos['market_value']:>10.2f}  ({pos['unrealized_plpc']:+.2f}%)")
     for bench, value in bases.items():
         print(f"  vs {bench} buy&hold:       ${value:>10.2f}  "
               f"({bot_value - value:+.2f})")
     log_event({"type": "snapshot", "bot_value": round(bot_value, 2),
+               "cash": round(cash, 2),
                "baselines": {b: round(v, 2) for b, v in bases.items()},
+               "positions": {t: {"shares": round(p["qty_f"], 6),
+                                 "avg_entry": p["avg_entry"],
+                                 "last": p["current_price"],
+                                 "value": p["market_value"],
+                                 "pl": p["unrealized_pl"],
+                                 "pl_pct": p["unrealized_plpc"]}
+                             for t, p in positions.items()},
                "held": sorted(positions)})
     return True
 
@@ -593,10 +850,101 @@ def selftest():
                           "market_type": "stocks"}) == ["A", "B"]
     assert _symbols_from({"nothing": "here"}) == []
 
+    # news formatting: symbols, source and summary all survive
+    line = format_news([{"when": "2026-08-27", "symbols": ["NVDA"],
+                         "headline": "Nvidia beats", "summary": "Raised guidance.",
+                         "source": "benzinga"}])
+    assert "NVDA: Nvidia beats" in line and "Raised guidance." in line, line
+    assert format_news([]).startswith("(no headlines")
+
+    # holding age comes from our own log, and a sell restarts the clock
+    global LOG_FILE, _api
+    real, LOG_FILE = LOG_FILE, Path(__file__).parent / "_tmp_selftest_log.jsonl"
+    old = (datetime.now(timezone.utc) - timedelta(days=6)).isoformat()
+    recent = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    LOG_FILE.write_text("".join(json.dumps(e) + "\n" for e in [
+        {"type": "order", "timestamp": old, "order": {"symbol": "AAA", "side": "buy"}},
+        {"type": "order", "timestamp": old, "order": {"symbol": "BBB", "side": "buy"}},
+        {"type": "order", "timestamp": recent, "order": {"symbol": "BBB", "side": "sell"}},
+        {"type": "order", "timestamp": recent, "order": {"symbol": "BBB", "side": "buy"}},
+    ]))
+    ages = holding_days({"AAA", "BBB"})
+    LOG_FILE.unlink()
+    LOG_FILE = real
+    assert round(ages["AAA"]) == 6 and round(ages["BBB"]) == 1, ages
+
+    # the prompt must state the horizon, the day, and the weekend carry
+    prompt = build_prompt(
+        {"AAPL": {"last_price": 100.0}},
+        {"equity": "1000", "cash": "500"},
+        {"AAPL": {"qty": "1", "qty_f": 1.0, "avg_entry": 90.0,
+                  "current_price": 100.0, "market_value": 100.0,
+                  "cost_basis": 90.0, "unrealized_pl": 10.0,
+                  "unrealized_plpc": 11.1}},
+        {"weekday": "Friday", "date": "2026-08-28",
+         "status": "open, 30 min to the close",
+         "next_trading_day": "2026-08-31", "days_until_next_session": 3},
+        [], {"AAPL": 4.0})
+    for must in ("SWING", "Friday 2026-08-28", "3 days away", "days_held",
+                 "Cash on hand", "RECENT NEWS", "daily_closes"):
+        assert must in prompt, must
+
     for reply in ('{"decisions": []}',
                   '```json\n{"decisions": []}\n```',
                   'Sure! Here you go:\n{"decisions": []}\nHope that helps.'):
         assert _extract_json(reply) == {"decisions": []}, reply
+    # Alpaca response shapes, parsed against a stub. The real calls cannot be
+    # exercised from a machine that cannot reach Alpaca, and these three are
+    # the parsing that a silent API change would break first.
+    def fake_api(method, base, path, **kw):
+        if path == "/v2/calendar":
+            return [{"date": "2026-08-27"}, {"date": "2026-08-28"},
+                    {"date": "2026-08-31"}]
+        if path == "/v2/stocks/snapshots":
+            return {"snapshots": {"AAA": {"dailyBar": {"o": 100.0, "c": 104.0},
+                                          "latestTrade": {"p": 105.0},
+                                          "prevDailyBar": {"c": 99.0}}}}
+        if path == "/v2/stocks/bars":
+            if kw["params"]["timeframe"] == "1Day":
+                return {"bars": {"AAA": [{"c": 90.0 + i} for i in range(25)]}}
+            return {"bars": {"AAA": [{"c": 104.0}, {"c": 105.0}]}}
+        if path == "/v1beta1/news":
+            return {"news": [{"headline": "AAA wins a contract",
+                              "summary": "Big one.", "source": "benzinga",
+                              "symbols": ["AAA", "ZZZ"],
+                              "created_at": "2026-08-27T12:00:00Z"}]}
+        raise AssertionError(path)
+
+    live_api, _api = _api, fake_api
+    try:
+        friday = day_context({"timestamp": "2026-08-28T15:30:00-04:00",
+                              "is_open": True,
+                              "next_close": "2026-08-28T16:00:00-04:00",
+                              "next_open": "2026-08-31T09:30:00-04:00"})
+        saturday = day_context({"timestamp": "2026-08-29T10:00:00-04:00",
+                                "is_open": False, "next_open": "x"})
+        holiday = day_context({"timestamp": "2026-09-07T10:00:00-04:00",
+                               "is_open": False, "next_open": "x"})
+        md = fetch_market_data(["AAA"], "2026-08-28")
+        news = fetch_news(["AAA"])
+    finally:
+        _api = live_api
+
+    assert friday["weekday"] == "Friday" and friday["minutes_to_close"] == 30, friday
+    assert friday["next_trading_day"] == "2026-08-31", friday
+    assert friday["days_until_next_session"] == 3, friday   # long weekend
+    assert saturday["status"] == "weekend", saturday
+    assert holiday["status"] == "market holiday", holiday   # a Monday, no session
+
+    bar = md["AAA"]
+    assert bar["daily_closes"][-1] == 114.0, bar
+    assert len(bar["daily_closes"]) == DAILY_BARS_SHOWN, bar
+    assert (bar["high_20d"], bar["low_20d"]) == (114.0, 95.0), bar
+    assert bar["pct_change_5d"] == -4.55 and bar["pct_change_20d"] == 10.53, bar
+    assert bar["recent_closes"] == [104.0, 105.0], bar
+    # news is filtered down to the pool we asked about
+    assert news[0]["symbols"] == ["AAA"] and news[0]["when"] == "2026-08-27", news
+
     print("selftest OK")
 
 

@@ -144,6 +144,11 @@ def render(events, demo=False):
     tiles = [("Bot equity", fmt_money(bot),
               f"{((bot / start - 1) * 100):+.2f}% since start" if start else "n/a",
               bot - start)]
+    cash = latest.get("cash")
+    if cash is not None:
+        deployed = (1 - float(cash) / bot) * 100 if bot else 0
+        tiles.append(("Cash in hand", fmt_money(float(cash)),
+                      f"{deployed:.0f}% of equity deployed", 0))
     for name, value in bases.items():
         tiles.append((f"vs {name}", fmt_delta(bot - float(value)),
                       f"{name} at {fmt_money(float(value))}", bot - float(value)))
@@ -156,9 +161,40 @@ def render(events, demo=False):
         f'<p class="sub">{sub}</p></div>'
         for label, value, sub, delta in tiles)
 
-    held = latest.get("held") or []
-    held_html = ("".join(f"<li>{h}</li>" for h in held)
-                 if held else '<li class="empty">no open positions</li>')
+    def cls(v):
+        return "up" if v > 0 else "down" if v < 0 else ""
+
+    positions = latest.get("positions") or {}
+    if positions:
+        prows = "".join(
+            f'<tr><td class="sym">{sym}</td>'
+            f'<td class="num">{float(p.get("shares") or 0):,.4f}</td>'
+            f'<td class="num">{fmt_money(float(p.get("avg_entry") or 0))}</td>'
+            f'<td class="num">{fmt_money(float(p.get("last") or 0))}</td>'
+            f'<td class="num">{fmt_money(float(p.get("value") or 0))}</td>'
+            f'<td class="num {cls(float(p.get("pl") or 0))}">'
+            f'{fmt_delta(float(p.get("pl") or 0))} '
+            f'({float(p.get("pl_pct") or 0):+.2f}%)</td></tr>'
+            for sym, p in sorted(positions.items()))
+        cash_row = ""
+        if cash is not None:
+            pct = float(cash) / bot * 100 if bot else 0
+            cash_row = (f'<tr><td class="sym">CASH</td>'
+                        f'<td colspan="3" class="empty">uninvested</td>'
+                        f'<td class="num">{fmt_money(float(cash))}</td>'
+                        f'<td class="num empty">{pct:.1f}% of equity</td></tr>')
+        held_html = (
+            '<div class="scroll"><table><thead><tr><th>Symbol</th>'
+            '<th class="num">Shares</th><th class="num">Avg entry</th>'
+            '<th class="num">Last</th><th class="num">Value</th>'
+            '<th class="num">Unrealized</th></tr></thead>'
+            f'<tbody>{prows}{cash_row}</tbody></table></div>')
+    elif latest.get("held"):
+        # snapshots logged before position detail existed: tickers only
+        held_html = ('<ul class="held">'
+                     + "".join(f"<li>{h}</li>" for h in latest["held"]) + "</ul>")
+    else:
+        held_html = '<p class="empty">no open positions</p>'
 
     rows = []
     for o in reversed(orders[-30:]):
@@ -216,9 +252,25 @@ def render(events, demo=False):
         if raw:
             blocks += (f'<details><summary>Raw model response</summary>'
                        f'<pre>{esc(raw)}</pre></details>')
+        headlines = last_call.get("news") or []
+        if headlines:
+            items = "".join(
+                f'<li><b>{esc(", ".join(n.get("symbols") or []) or "market")}</b> '
+                f'<span class="sub">{esc(n.get("when", ""))} · '
+                f'{esc(n.get("source", ""))}</span><br>'
+                f'{esc(n.get("headline", ""))}</li>' for n in headlines)
+            blocks += (f'<details><summary>Headlines it read '
+                       f'({len(headlines)})</summary>'
+                       f'<ul class="news">{items}</ul></details>')
+        day = last_call.get("day") or {}
+        day_line = (f'{esc(day.get("weekday", ""))} {esc(day.get("date", ""))}, '
+                    f'{esc(day.get("status", ""))}<br>' if day else "")
         think_html = (
-            f'<p class="sub">{len(last_call.get("candidates") or [])} candidates '
-            f'screened · {acted} acted on · {when(last_call.get("timestamp"))}'
+            f'<p class="sub">{day_line}'
+            f'{len(last_call.get("candidates") or [])} candidates '
+            f'screened · {acted} acted on · {len(headlines)} '
+            f'headline{"" if len(headlines) == 1 else "s"} '
+            f'· {when(last_call.get("timestamp"))}'
             f'<br>{esc(last_call.get("model", "?"))}{toks}</p>'
             f'<div class="scroll"><table><thead><tr><th>Symbol</th><th>Call</th>'
             f'<th>Reasoning</th></tr></thead><tbody>{drows or ""}</tbody>'
@@ -289,6 +341,11 @@ def render(events, demo=False):
   td {{ padding:8px 10px 8px 0; border-top:1px solid var(--line);
     vertical-align:top; }}
   .nowrap {{ white-space:nowrap; }}
+  .num {{ text-align:right; white-space:nowrap;
+    font-variant-numeric:tabular-nums; padding-right:16px; }}
+  td.up {{ color:var(--up); }} td.down {{ color:var(--down); }}
+  ul.news {{ margin:6px 0 0; padding-left:18px; }}
+  ul.news li {{ margin-bottom:10px; }}
   .sym {{ font-weight:650; }}
   .side {{ font-weight:700; font-size:11px; padding:2px 6px; border-radius:4px; }}
   .side.buy {{ background:rgba(63,185,80,.15); color:var(--up); }}
@@ -324,8 +381,8 @@ def render(events, demo=False):
   </div>
 
   <div class="card">
-    <h3>Currently held</h3>
-    <ul class="held">{held_html}</ul>
+    <h3>Portfolio</h3>
+    {held_html}
   </div>
 
   <div class="card">
@@ -342,7 +399,8 @@ def render(events, demo=False):
     </table></div>
   </div>
 
-  <footer>Simulated trading only. No real money is involved. The bot beating
+  <footer>Simulated trading only. No real money is involved. Swing / mid-term
+  horizon: positions are meant to be held for days to weeks. The bot beating
   or losing to a benchmark over days means nothing; judge it over months.</footer>
 </div>
 """
@@ -365,6 +423,13 @@ def demo_events(runs=40):
         events.append({
             "type": "decisions", "timestamp": stamp,
             "candidates": names + ["SPY", "QQQ"],
+            "day": {"weekday": "Thursday", "date": stamp[:10],
+                    "status": "open, 122 min to the close",
+                    "next_trading_day": "2026-08-31",
+                    "days_until_next_session": 3},
+            "news": [{"when": stamp[:10], "symbols": [picks[0]],
+                      "source": "benzinga",
+                      "headline": f"{picks[0]} guides above consensus for Q3"}],
             "model": "deepseek/deepseek-v4-flash",
             "usage": {"prompt_tokens": 1840, "completion_tokens": 412},
             "thinking": "Scanning the pool for anything with a real intraday "
@@ -386,10 +451,20 @@ def demo_events(runs=40):
                 "reasoning": f"{sym} is up on heavy volume and holding its "
                              f"intraday range; adding a small position.",
             })
+        held = sorted(random.sample(names, 3))
         events.append({
             "type": "snapshot", "timestamp": stamp, "bot_value": round(bot, 2),
+            "cash": round(bot * 0.38, 2),
             "baselines": {"SPY": round(spy, 2), "QQQ": round(qqq, 2)},
-            "held": sorted(random.sample(names, 3)),
+            "positions": {
+                h: {"shares": round(random.uniform(5, 90), 4),
+                    "avg_entry": round(random.uniform(20, 400), 2),
+                    "last": round(random.uniform(20, 400), 2),
+                    "value": round(bot * 0.62 / 3, 2),
+                    "pl": round(random.uniform(-800, 900), 2),
+                    "pl_pct": round(random.uniform(-6, 7), 2)}
+                for h in held},
+            "held": held,
         })
     return events
 
@@ -402,8 +477,16 @@ def selfcheck():
     page = render(demo_events(), demo=True)
     for must in ("DEMO DATA", "vs SPY", "vs QQQ", "<polyline", "NVDA",
                  "candidates", "HOLD", "every candidate it looked at",
-                 "Raw model response", "Model thinking", "1840 in / 412 out"):
+                 "Raw model response", "Model thinking", "1840 in / 412 out",
+                 # portfolio detail, cash, day awareness and news
+                 "Avg entry", "Unrealized", "Cash in hand", "CASH",
+                 "of equity deployed", "Headlines it read",
+                 "guides above consensus", "min to the close"):
         assert must in page, must
+    # old snapshots carry tickers only; they must still render as chips
+    legacy = render([{"type": "snapshot", "timestamp": "2026-01-01T00:00:00+00:00",
+                      "bot_value": 100.0, "held": ["ZZZ"]}])
+    assert 'class="held"' in legacy and "ZZZ" in legacy
     # a failed call must be visible, and its text escaped not executed
     broke = render([{"type": "llm_error", "timestamp": "2026-01-02T00:00:00+00:00",
                      "model": "x/y", "error": "boom <script>alert(1)</script>"}])

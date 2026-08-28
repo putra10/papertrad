@@ -121,15 +121,16 @@ The workflow is [.github/workflows/trade.yml](.github/workflows/trade.yml).
 **Set it up once and it runs itself.** Nothing needs to be started by hand
 on a trading day.
 
-**It fires once per session, not on every cycle.** That is deliberate.
+**It fires once per session, not every 15 minutes.** That is deliberate.
 GitHub's scheduler is unreliable at short intervals: a `*/15` cron runs
 late and silently drops slots, and asking it for 36 fires a day gives it
 36 chances to fail. Instead it fires once, and `paper_trader.py --session`
-holds the cadence itself with real sleeps. The cadence becomes exact; only
-the start time is at GitHub's mercy.
+holds the 15-minute cadence itself with real sleeps. The cadence becomes
+exact; only the start time is at GitHub's mercy.
 
-**The cadence is hourly (`--session 60`).** Re-deciding four times an hour
-churns positions the model is supposed to be carrying for days.
+**The cadence stays at 15 minutes (`--session 15`)** even though the horizon
+is swing. What makes it mid-term is the prompt, not how often it looks; a
+frequent check just costs little and draws a denser equity curve.
 
 **Holidays need no cron rule.** The crons cover Mon-Fri; on Thanksgiving or
 Labor Day the script asks Alpaca's clock and calendar, prints why the market
@@ -192,8 +193,8 @@ The single number that matters is the bot's equity against QQQ over
 python paper_trader.py --loop 15
 ```
 
-Polls every 15 minutes (CI uses `--session 60`, which also exits on its own
-at the close). US market hours are 9:30am–4:00pm ET, roughly
+Polls every 15 minutes, the same cadence CI uses (`--session 15` adds
+exiting on its own at the close). US market hours are 9:30am–4:00pm ET, roughly
 8:30pm–3:00am WIB (Indonesia time) — late nights if you babysit it, so a
 scheduler is usually nicer. Off-hours runs cost one cheap clock call and
 exit, so leaving the loop running overnight is harmless.
@@ -308,11 +309,11 @@ time** — swapping models mid-experiment resets your evidence.
 
 ## Notes on cost
 
-Each run = one LLM API call. Hourly across ~6.5 hours of market time is
-~7 calls/day. No output or thinking cap is sent, so a reasoning model will
-use its full budget and those calls are not tiny; on the default model
-that is still cents per month, and on a free slug it is nothing. Alpaca
-itself costs nothing here, news endpoint included.
+Each run = one LLM API call. Every 15 min for ~6.5 hours of market time is
+~26 calls/day. No output or thinking cap is sent and the prompt now carries
+daily bars and headlines, so these calls are bigger than they were; on the
+default model that is still cents per month, and on a free slug it is
+nothing. Alpaca itself costs nothing here, news endpoint included.
 
 ## Important honesty check
 

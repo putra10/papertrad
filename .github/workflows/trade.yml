@@ -5,11 +5,11 @@ name: paper-trade
 #
 # GitHub's scheduler is unreliable for short intervals: a */15 cron drops
 # slots and runs late. So it is asked to fire only ONCE per session, and
-# the script holds its own cadence with real sleeps.
+# the script holds the 15-minute cadence itself with real sleeps.
 #
-# The cadence is hourly, not every 15 minutes: this is a swing / mid-term
-# portfolio, so re-deciding four times an hour just churns positions the
-# model is supposed to be carrying for days.
+# The horizon is swing / mid-term, but the cadence stays at 15 minutes: the
+# prompt is what tells the model to carry positions for days, and checking
+# often costs little while giving a much denser equity curve.
 #
 # Market holidays need no cron rule. The crons cover Mon-Fri, and on a
 # holiday the script asks Alpaca's clock and calendar, finds the market
@@ -68,7 +68,7 @@ jobs:
           APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           AUTO_COMMIT: "1"        # push state every cycle, not just at the end
-        run: python paper_trader.py --session 60
+        run: python paper_trader.py --session 15
 
       - name: Final sync
         if: always()              # still commit if the session errored out

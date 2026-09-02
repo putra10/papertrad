@@ -86,7 +86,17 @@ DAILY_BARS_SHOWN = 20                  # ~1 month of daily closes per name
 DAILY_LOOKBACK_DAYS = 45               # calendar days pulled to fill them
 HOLD_DAYS_TARGET = "3 to 15 trading days"
 NEWS_LOOKBACK_DAYS = 5
-NEWS_LIMIT = 40
+NEWS_LIMIT = 60            # raised from 40: earnings prints are what the
+                           # prompt leans on hardest, and at 40 (newest first,
+                           # ~9 tickers, 5 days) a report from Monday fell off
+                           # the end of the list entirely
+# Alpaca's news endpoint has no text search and the free tier carries no
+# earnings calendar, so the headlines already pulled are the only earnings
+# signal available. Broad on purpose: surfacing a near-miss costs one line of
+# prompt, missing a guidance cut costs the position.
+EARNINGS_WORDS = ("earnings", "eps", "quarterly result", "quarter result",
+                  "guidance", "outlook", "forecast", "revenue", "beats",
+                  "misses", "reports q", "results for", "profit")
 
 # OpenRouter model, $/M tokens in/out as of 2026-08. The script does the
 # trading; the model only has to return the JSON, so cheap is fine.
@@ -427,7 +437,17 @@ def fetch_news(tickers, days=NEWS_LOOKBACK_DAYS):
 
 # ----------------------------- LLM ---------------------------------------
 
-def format_news(news):
+def is_earnings(n):
+    """Earnings / guidance headline?
+
+    Buried 30 rows down a list of 60, an earnings print reads like any other
+    headline. Pulled into its own block it reads like the event it is.
+    """
+    return any(w in f"{n['headline']} {n['summary']}".lower()
+               for w in EARNINGS_WORDS)
+
+
+def format_news(news, empty="(no headlines for these names)"):
     lines = []
     for n in news:
         tag = ", ".join(n["symbols"]) or "market"
@@ -437,7 +457,7 @@ def format_news(news):
         if n["summary"]:
             head += f"\n    {n['summary']}"
         lines.append(head)
-    return "\n".join(lines) or "(no headlines for these names)"
+    return "\n".join(lines) or empty
 
 
 def build_prompt(market_data, account, positions, day, news, held_days):
@@ -451,6 +471,8 @@ def build_prompt(market_data, account, positions, day, news, held_days):
             "days_held": held_days.get(t)}
         for t, p in positions.items()
     }
+    earnings = [n for n in news if is_earnings(n)]
+    rest = [n for n in news if not is_earnings(n)]
     carry = day.get("days_until_next_session")
     carry_note = ("The next session is TOMORROW."
                   if carry == 1 else
@@ -462,6 +484,13 @@ def build_prompt(market_data, account, positions, day, news, held_days):
     return f"""You are a trading research assistant running a SIMULATED
 (Alpaca paper trading, no real money) portfolio experiment. Analyze the
 data below and return a decision for each ticker.
+
+OBJECTIVE: beat a buy-and-hold of {" and ".join(BENCHMARKS)} on total
+return. Matching the market is a loss here. Note that simply holding
+{BENCHMARKS[0]} IS matching it - hold an index only as a deliberate
+defensive park while you wait for a setup, never as a default resting
+place. Every name you own should be one you expect to outrun the index
+over the horizon below; if you cannot say why it would, that is a sell.
 
 TIME HORIZON: this is a SWING / MID-TERM portfolio, not a day-trading one.
 You are holding for {HOLD_DAYS_TARGET} - days to weeks, not minutes. Judge
@@ -484,10 +513,16 @@ context only. {" and ".join(BENCHMARKS)} are included as market references -
 you may trade them like anything else:
 {json.dumps(market_data, indent=2)}
 
-RECENT NEWS for these names (last {NEWS_LOOKBACK_DAYS} days, newest first).
-Weigh this: over a multi-day horizon, a catalyst or a guidance cut matters
-more than the chart. Say in your reasoning when a headline drove the call:
-{format_news(news)}
+EARNINGS AND GUIDANCE, last {NEWS_LOOKBACK_DAYS} days. Over a swing horizon
+this is the single hardest-hitting input you have - a beat with raised
+guidance, or a miss with a cut, resets the multi-day trend no matter what
+the chart was doing. Read it before the chart:
+{format_news(earnings, "(no earnings or guidance news in this window)")}
+
+OTHER RECENT NEWS for these names (last {NEWS_LOOKBACK_DAYS} days, newest
+first). Weigh this too: over a multi-day horizon a catalyst matters more
+than the chart. Say in your reasoning when a headline drove the call:
+{format_news(rest)}
 
 YOU choose which of these to trade. This is an ACTIVE experiment: cash
 sitting idle earns nothing and generates no data, so bias toward holding
@@ -930,10 +965,24 @@ def selftest():
         {"weekday": "Friday", "date": "2026-08-28",
          "status": "open, 30 min to the close",
          "next_trading_day": "2026-08-31", "days_until_next_session": 3},
-        [], {"AAPL": 4.0})
+        [{"when": "2026-08-27", "symbols": ["AAPL"], "source": "benzinga",
+          "headline": "Apple Q3 earnings beat, raises guidance",
+          "summary": "EPS above consensus."},
+         {"when": "2026-08-26", "symbols": ["AAPL"], "source": "benzinga",
+          "headline": "Apple opens a new store in Ohio", "summary": ""}],
+        {"AAPL": 4.0})
     for must in ("SWING", "Friday 2026-08-28", "3 days away", "days_held",
-                 "Cash on hand", "RECENT NEWS", "daily_closes"):
+                 "Cash on hand", "OTHER RECENT NEWS", "daily_closes",
+                 # the objective the whole experiment is scored on
+                 "beat a buy-and-hold of SPY and QQQ",
+                 "EARNINGS AND GUIDANCE"):
         assert must in prompt, must
+    # the earnings print goes in the earnings block, the store opening does not
+    head, _, tail = prompt.partition("OTHER RECENT NEWS")
+    assert "raises guidance" in head and "raises guidance" not in tail, prompt
+    assert "new store in Ohio" in tail, prompt
+    assert is_earnings({"headline": "Q3 EPS misses", "summary": ""})
+    assert not is_earnings({"headline": "CEO visits Ohio", "summary": ""})
 
     for reply in ('{"decisions": []}',
                   '```json\n{"decisions": []}\n```',

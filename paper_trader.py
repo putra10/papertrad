@@ -57,6 +57,7 @@ import math
 import os
 import sys
 import time
+import traceback
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -356,10 +357,26 @@ def fetch_market_data(tickers, session_date):
             continue
         last = ((s.get("latestTrade") or {}).get("p")
                 or (s.get("minuteBar") or {}).get("c") or daily.get("c"))
+        if not last:
+            print(f"  [warn] no price for {t}")
+            continue                    # nothing usable without a last price
         day_open = daily.get("o")
         prev_close = (s.get("prevDailyBar") or {}).get("c")
         full = [round(b["c"], 2) for b in dailies.get(t, [])]
         closes = full[-DAILY_BARS_SHOWN:]
+
+        def pct(now, base):
+            """% move, or None when the base is missing or zero.
+
+            The screener hands back whatever is most active, and a name that
+            has not printed a trade today comes back with dailyBar.o == 0.
+            Dividing by that used to raise, and since run_loop only prints
+            the exception and sleeps, ONE such ticker killed every cycle for
+            the rest of the day: no model call, no orders, no commits.
+            Report the gap as None instead -- and never drop the ticker over
+            it, because a held name missing from the pool can never be sold.
+            """
+            return round((now - base) / base * 100, 2) if base else None
 
         def back(n, _c=full, _last=last):
             """% move vs n daily bars ago; None when history is that short.
@@ -367,14 +384,13 @@ def fetch_market_data(tickers, session_date):
             Reads the whole pulled series, not the shown slice, so a 20-day
             comparison is not asking a 20-long list for its 20th-from-last.
             """
-            return (round((_last - _c[-n]) / _c[-n] * 100, 2)
-                    if len(_c) > n else None)
+            return pct(_last, _c[-n]) if len(_c) > n else None
 
         data[t] = {
             "last_price": round(float(last), 2),
-            "day_open": round(float(day_open), 2),
+            "day_open": round(float(day_open), 2) if day_open else None,
             "prev_close": round(float(prev_close), 2) if prev_close else None,
-            "pct_change_today": round((last - day_open) / day_open * 100, 2),
+            "pct_change_today": pct(last, day_open),
             "pct_change_5d": back(5),
             "pct_change_20d": back(20),
             "high_20d": max(closes) if closes else None,
@@ -830,8 +846,11 @@ def run_loop(interval_minutes=15, until_close=False, max_hours=5.75):
                     print("Market was already closed. Nothing to do.")
                     return
             sync_to_git()
-        except Exception as e:
-            print(f"Unexpected error: {e}")
+        except Exception:
+            # Print the traceback, not just str(e): "float division by zero"
+            # on its own said nothing about where, and this loop keeps going
+            # for hours after the first failure.
+            traceback.print_exc()
         time.sleep(interval_minutes * 60)
     print(f"Hit the {max_hours}h cap. Exiting so the job finishes cleanly.")
 
@@ -923,9 +942,15 @@ def selftest():
             return [{"date": "2026-08-27"}, {"date": "2026-08-28"},
                     {"date": "2026-08-31"}]
         if path == "/v2/stocks/snapshots":
-            return {"snapshots": {"AAA": {"dailyBar": {"o": 100.0, "c": 104.0},
-                                          "latestTrade": {"p": 105.0},
-                                          "prevDailyBar": {"c": 99.0}}}}
+            return {"snapshots": {
+                "AAA": {"dailyBar": {"o": 100.0, "c": 104.0},
+                        "latestTrade": {"p": 105.0},
+                        "prevDailyBar": {"c": 99.0}},
+                # a name the screener returned that has not traded today
+                "ZZZ": {"dailyBar": {"o": 0.0, "c": 7.0},
+                        "latestTrade": {"p": 7.0}},
+                # and one with no price at all
+                "QQQQ": {"dailyBar": {"o": 0.0}}}}
         if path == "/v2/stocks/bars":
             if kw["params"]["timeframe"] == "1Day":
                 return {"bars": {"AAA": [{"c": 90.0 + i} for i in range(25)]}}
@@ -947,7 +972,7 @@ def selftest():
                                 "is_open": False, "next_open": "x"})
         holiday = day_context({"timestamp": "2026-09-07T10:00:00-04:00",
                                "is_open": False, "next_open": "x"})
-        md = fetch_market_data(["AAA"], "2026-08-28")
+        md = fetch_market_data(["AAA", "ZZZ", "QQQQ"], "2026-08-28")
         news = fetch_news(["AAA"])
     finally:
         _api = live_api
@@ -964,6 +989,14 @@ def selftest():
     assert (bar["high_20d"], bar["low_20d"]) == (114.0, 95.0), bar
     assert bar["pct_change_5d"] == -4.55 and bar["pct_change_20d"] == 10.53, bar
     assert bar["recent_closes"] == [104.0, 105.0], bar
+
+    # A zero open must not raise: one such ticker used to kill the cycle, and
+    # every cycle after it, for the rest of the session. Report None, keep the
+    # ticker (a held name dropped from the pool can never be sold).
+    zzz = md["ZZZ"]
+    assert zzz["pct_change_today"] is None and zzz["day_open"] is None, zzz
+    assert zzz["last_price"] == 7.0, zzz
+    assert "QQQQ" not in md, "a ticker with no price at all is unusable"
     # news is filtered down to the pool we asked about
     assert news[0]["symbols"] == ["AAA"] and news[0]["when"] == "2026-08-27", news
 
@@ -976,10 +1009,13 @@ def show_screen():
     candidates = fetch_candidates(held.keys())
     print(f"pool ({len(candidates)}): {', '.join(candidates)}")
     data = fetch_market_data(candidates, get_clock()["timestamp"][:10])
-    for t, d in sorted(data.items(), key=lambda kv: -abs(kv[1]["pct_change_today"])):
+    for t, d in sorted(data.items(),
+                       key=lambda kv: -abs(kv[1]["pct_change_today"] or 0)):
         flags = " [held]" if t in held else (" [benchmark]" if t in BENCHMARKS else "")
         skip = "" if d["last_price"] >= MIN_PRICE or flags else "  <- below MIN_PRICE"
-        print(f"  {t:<6} ${d['last_price']:>9.2f}  {d['pct_change_today']:>+7.2f}%{flags}{skip}")
+        today = d["pct_change_today"]
+        moved = f"{today:>+7.2f}%" if today is not None else "      ?"
+        print(f"  {t:<6} ${d['last_price']:>9.2f}  {moved}{flags}{skip}")
 
 
 if __name__ == "__main__":

@@ -562,7 +562,12 @@ def call_llm(prompt, effort="high"):
             # models that support thinking will use it; the rest ignore this
             "reasoning": {"effort": effort},
         },
-        timeout=600,
+        # Measured 2026-09-02: 9m40s for one call, against a 600s ceiling --
+        # a 20-second margin. The cheapest provider for this model runs at
+        # 5-7 tok/s and "high" effort makes the reasoning trace long, so the
+        # call is slow by design. Give it real headroom: a timeout here costs
+        # the whole cycle, while a slow answer costs only the clock.
+        timeout=900,
     )
     resp.raise_for_status()
     body = resp.json()

@@ -883,6 +883,11 @@ def run_loop(interval_minutes=15, until_close=False, max_hours=5.75):
     deadline = time.monotonic() + max_hours * 3600
     seen_open = False
     while time.monotonic() < deadline:
+        # Measure the interval from the START of the cycle, not the end. The
+        # old code slept a full 15 minutes AFTER the work, so the real period
+        # was 15 + however long the model took -- 16 to 23 minutes in the
+        # 2026-09-01 commit stamps, drifting wider as the model got slower.
+        next_at = time.monotonic() + interval_minutes * 60
         try:
             is_open = run_once()
             if until_close:
@@ -900,7 +905,8 @@ def run_loop(interval_minutes=15, until_close=False, max_hours=5.75):
             # on its own said nothing about where, and this loop keeps going
             # for hours after the first failure.
             traceback.print_exc()
-        time.sleep(interval_minutes * 60)
+        # A cycle slower than the interval just runs straight into the next.
+        time.sleep(max(0.0, next_at - time.monotonic()))
     print(f"Hit the {max_hours}h cap. Exiting so the job finishes cleanly.")
 
 
@@ -1071,6 +1077,26 @@ def selftest():
     # a sold-out position must not linger: held names are pinned into the pool
     # on purpose, so a ghost can never rotate out on its own
     assert list(held) == ["AAA"], held
+
+    # cadence: the interval is measured from the START of a cycle, so slow work
+    # eats into the sleep instead of stacking on top of it
+    global run_once, sync_to_git
+    real_once, real_sync, real_sleep = run_once, sync_to_git, time.sleep
+    slept, calls = [], []
+    def slow_once():
+        calls.append(1)
+        if len(calls) > 1:
+            return False                  # market closed -> the loop exits
+        real_sleep(1.0)                   # a cycle that takes a whole second
+        return True
+    run_once, sync_to_git = slow_once, lambda: None
+    time.sleep = slept.append
+    try:
+        run_loop(interval_minutes=3 / 60, until_close=True)
+    finally:
+        run_once, sync_to_git, time.sleep = real_once, real_sync, real_sleep
+    assert len(slept) == 1, slept
+    assert 1.5 < slept[0] < 2.5, f"3s interval minus 1s of work, got {slept}"
     # news is filtered down to the pool we asked about
     assert news[0]["symbols"] == ["AAA"] and news[0]["when"] == "2026-08-27", news
 

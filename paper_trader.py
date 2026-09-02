@@ -86,10 +86,11 @@ DAILY_BARS_SHOWN = 20                  # ~1 month of daily closes per name
 DAILY_LOOKBACK_DAYS = 45               # calendar days pulled to fill them
 HOLD_DAYS_TARGET = "3 to 15 trading days"
 NEWS_LOOKBACK_DAYS = 5
-NEWS_LIMIT = 60            # raised from 40: earnings prints are what the
-                           # prompt leans on hardest, and at 40 (newest first,
-                           # ~9 tickers, 5 days) a report from Monday fell off
-                           # the end of the list entirely
+NEWS_LIMIT = 50            # Alpaca's hard maximum -- 60 is a 400 and the whole
+                           # news fetch comes back empty. Raised from 40 because
+                           # earnings prints are what the prompt leans on
+                           # hardest, and newest-first across ~9 tickers and 5
+                           # days pushed a Monday report off the end.
 # Alpaca's news endpoint has no text search and the free tier carries no
 # earnings calendar, so the headlines already pulled are the only earnings
 # signal available. Broad on purpose: surfacing a near-miss costs one line of

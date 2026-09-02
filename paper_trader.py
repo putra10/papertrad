@@ -174,6 +174,14 @@ def get_positions():
     """ticker -> full position detail. `qty` stays the API's exact string."""
     out = {}
     for p in _api("GET", TRADE_URL, "/v2/positions"):
+        # Alpaca keeps reporting a fully-exited name with qty 0. SNXX was sold
+        # out on 2026-09-01 and still came back every cycle after: pinned into
+        # the candidate pool as "held" (so it could never rotate out), fed to
+        # the model as a holding worth $0.00, and a prime suspect for the
+        # zero-open crash, since a name nobody trades any more prints no bars.
+        # You do not hold zero shares of anything.
+        if not float(p["qty"]):
+            continue
         out[p["symbol"]] = {
             "qty": p["qty"],
             "qty_f": float(p["qty"]),
@@ -992,6 +1000,12 @@ def selftest():
     # exercised from a machine that cannot reach Alpaca, and these three are
     # the parsing that a silent API change would break first.
     def fake_api(method, base, path, **kw):
+        if path == "/v2/positions":
+            return [{"symbol": "AAA", "qty": "2", "avg_entry_price": "10",
+                     "unrealized_plpc": "0.1"},
+                    # fully exited, but Alpaca still lists it
+                    {"symbol": "GHOST", "qty": "0", "avg_entry_price": "14.72",
+                     "unrealized_plpc": "0"}]
         if path == "/v2/calendar":
             return [{"date": "2026-08-27"}, {"date": "2026-08-28"},
                     {"date": "2026-08-31"}]
@@ -1026,6 +1040,7 @@ def selftest():
                                 "is_open": False, "next_open": "x"})
         holiday = day_context({"timestamp": "2026-09-07T10:00:00-04:00",
                                "is_open": False, "next_open": "x"})
+        held = get_positions()
         md = fetch_market_data(["AAA", "ZZZ", "QQQQ"], "2026-08-28")
         news = fetch_news(["AAA"])
     finally:
@@ -1051,6 +1066,10 @@ def selftest():
     assert zzz["pct_change_today"] is None and zzz["day_open"] is None, zzz
     assert zzz["last_price"] == 7.0, zzz
     assert "QQQQ" not in md, "a ticker with no price at all is unusable"
+
+    # a sold-out position must not linger: held names are pinned into the pool
+    # on purpose, so a ghost can never rotate out on its own
+    assert list(held) == ["AAA"], held
     # news is filtered down to the pool we asked about
     assert news[0]["symbols"] == ["AAA"] and news[0]["when"] == "2026-08-27", news
 

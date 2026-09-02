@@ -601,8 +601,13 @@ def call_llm(prompt, effort="high"):
             "model": MODEL,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.3,
-            # route to whichever host serves this model cheapest
-            "provider": {"sort": "price"},
+            # Route on speed, not price. Measured 2026-09-02, same model,
+            # same prompt shape: DigitalOcean 3.8 tok/s (a 9m40s call, 20
+            # seconds off the timeout) vs StreamLake 69.7 tok/s (about 40
+            # seconds). The cheapest host cost $0.000765 and the fastest
+            # $0.000913 -- a fifth of a cent to stop a single cycle from
+            # eating two thirds of the 15-minute interval.
+            "provider": {"sort": "throughput"},
             # models that support thinking will use it; the rest ignore this
             "reasoning": {"effort": effort},
         },

@@ -771,16 +771,38 @@ def sync_to_git():
     def sh(*args):
         return subprocess.run(args, cwd=here, capture_output=True, text=True)
 
+    # A merge or rebase left half-done by an earlier cycle detaches HEAD, and
+    # from then on every push fails with "You are not currently on a branch".
+    # Clear the wreckage and get back on the branch before touching anything.
+    sh("git", "rebase", "--abort")
+    sh("git", "merge", "--abort")
+    if sh("git", "symbolic-ref", "-q", "HEAD").returncode:
+        sh("git", "checkout", "-B", "main")
+
     sh("python", "build_dashboard.py")
     sh("git", "add", "-A", "baseline_state.json", "trade_log.jsonl", "docs")
     if sh("git", "diff", "--staged", "--quiet").returncode == 0:
         return                                    # nothing changed this cycle
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    sh("git", "commit", "-m", f"run {stamp}")
-    sh("git", "pull", "--rebase", "--autostash")
-    pushed = sh("git", "push")
-    if pushed.returncode:
-        print(f"  [warn] push failed: {pushed.stderr[:200]}")
+    if sh("git", "commit", "-m", f"run {stamp}").returncode:
+        print("  [warn] commit failed; state stays local this cycle")
+        return
+
+    # Merge, never rebase: a conflicted rebase detaches HEAD, a conflicted
+    # merge does not. `-X ours` settles baseline_state.json and docs/ (both
+    # are rebuilt from the log every cycle, so ours is the fresher copy) and
+    # .gitattributes unions the log itself, so there is nothing left to stop
+    # on. Retry because origin can move between the merge and the push.
+    for attempt in range(3):
+        pull = sh("git", "pull", "--no-rebase", "--no-edit", "-X", "ours",
+                  "origin", "main")
+        if pull.returncode:
+            sh("git", "merge", "--abort")
+            print(f"  [warn] merge failed: {pull.stderr.strip()[:200]}")
+            return                          # next cycle retries from scratch
+        if sh("git", "push", "origin", "HEAD:main").returncode == 0:
+            return
+    print("  [warn] push kept losing the race; next cycle will carry the state")
 
 
 def run_loop(interval_minutes=15, until_close=False, max_hours=5.75):

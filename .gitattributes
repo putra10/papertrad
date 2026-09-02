@@ -1,0 +1,7 @@
+# trade_log.jsonl is append-only: two sides that both appended are not a
+# conflict, they are two sets of new lines. `union` keeps both instead of
+# stopping the merge. Without this, a run that started from a stale checkout
+# wedged the merge, detached HEAD, and every push for the rest of the session
+# failed with "You are not currently on a branch" -- silently losing a whole
+# session's worth of trading.
+trade_log.jsonl merge=union

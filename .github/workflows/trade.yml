@@ -50,6 +50,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4   # keeps credentials so the script can push
+        with:
+          # Default depth=1 leaves nothing to merge against when a queued
+          # run starts from a base origin has already moved past.
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -68,6 +72,9 @@ jobs:
           APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           AUTO_COMMIT: "1"        # push state every cycle, not just at the end
+          # Without this Python block-buffers stdout: a cancelled run flushes
+          # nothing, so the log looks like the bot never did anything.
+          PYTHONUNBUFFERED: "1"
         run: python paper_trader.py --session 15
 
       - name: Final sync

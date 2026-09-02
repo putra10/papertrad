@@ -35,6 +35,10 @@ def read_events(path):
             events.append(json.loads(line))
         except json.JSONDecodeError:
             continue        # a half-written line from a killed run; skip it
+    # A union merge of two sessions' appends interleaves the lines, so file
+    # order is not time order. Everything downstream reads the tail as "the
+    # latest", so sort. Timestamps are ISO-8601 UTC, hence sorting as text.
+    events.sort(key=lambda e: e.get("timestamp") or "")
     return events
 
 

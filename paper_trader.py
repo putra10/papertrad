@@ -74,6 +74,8 @@ MIN_PRICE = 5.00           # skip sub-$5 names; screeners surface junk
 TARGET_DEPLOYED_PCT = 60   # how much equity the model is told to put to work
 MAX_PER_NAME_PCT = 25      # and the most it should put in any single name
 BENCHMARKS = ["SPY", "QQQ"]  # buy & hold comparisons, tracked separately
+DUST_SHARES = 1e-6         # below this a "position" is Alpaca residue, not a
+                           # holding: at any real price it is under a cent
 
 BAR_TIMEFRAME = "5Min"                 # 1Min, 5Min, 15Min, 1Hour...
 BARS_SHOWN = 6                         # recent intraday bars sent to the LLM
@@ -175,13 +177,17 @@ def get_positions():
     """ticker -> full position detail. `qty` stays the API's exact string."""
     out = {}
     for p in _api("GET", TRADE_URL, "/v2/positions"):
-        # Alpaca keeps reporting a fully-exited name with qty 0. SNXX was sold
-        # out on 2026-09-01 and still came back every cycle after: pinned into
-        # the candidate pool as "held" (so it could never rotate out), fed to
-        # the model as a holding worth $0.00, and a prime suspect for the
-        # zero-open crash, since a name nobody trades any more prints no bars.
-        # You do not hold zero shares of anything.
-        if not float(p["qty"]):
+        # A fully-exited name keeps coming back as a position holding DUST --
+        # not a clean zero, but something like 1e-9 shares, which is why an
+        # `if not float(qty)` test missed it. SNXX has been a ghost since
+        # 2026-09-01 and SPY joined it the moment it was sold out. Held names
+        # are pinned into the candidate pool on purpose, so a ghost can never
+        # rotate out: it takes a pool slot every cycle, reaches the model as a
+        # holding worth $0.00, and is the likeliest source of the zero-open
+        # crash, since a name nobody trades any more prints no bars.
+        # Below a millionth of a share there is no price at which you own
+        # anything worth a cent.
+        if abs(float(p["qty"])) < DUST_SHARES:
             continue
         out[p["symbol"]] = {
             "qty": p["qty"],
@@ -1015,9 +1021,12 @@ def selftest():
         if path == "/v2/positions":
             return [{"symbol": "AAA", "qty": "2", "avg_entry_price": "10",
                      "unrealized_plpc": "0.1"},
-                    # fully exited, but Alpaca still lists it
+                    # fully exited, but Alpaca still lists them -- one as a
+                    # clean zero, one as the dust it actually returns
                     {"symbol": "GHOST", "qty": "0", "avg_entry_price": "14.72",
-                     "unrealized_plpc": "0"}]
+                     "unrealized_plpc": "0"},
+                    {"symbol": "DUST", "qty": "0.000000001",
+                     "avg_entry_price": "761.33", "unrealized_plpc": "0"}]
         if path == "/v2/calendar":
             return [{"date": "2026-08-27"}, {"date": "2026-08-28"},
                     {"date": "2026-08-31"}]

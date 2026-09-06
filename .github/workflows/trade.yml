@@ -75,6 +75,7 @@ jobs:
           # Unset = the sync prints "skipped" and the session runs unchanged.
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          DASHBOARD_TOKEN: ${{ secrets.DASHBOARD_TOKEN }}
           AUTO_COMMIT: "1"        # push state every cycle, not just at the end
           # Without this Python block-buffers stdout: a cancelled run flushes
           # nothing, so the log looks like the bot never did anything.
@@ -86,6 +87,7 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          DASHBOARD_TOKEN: ${{ secrets.DASHBOARD_TOKEN }}
         run: |
           # Every cycle already pushed its own state, so origin is the truth.
           # Reset to it before rebuilding: a run that was queued behind another

@@ -2,9 +2,11 @@
 Mirror the bot's book into a Dashboard Porto account, so the same positions
 show up there next to the human-managed portfolios.
 
-The dashboard keeps one account per 7-character token. This writes the bot's
-book into ONE reserved token (BOT-001) on every run: open the dashboard, type
-that token, and you are looking at the paper trader.
+The dashboard keeps one account per 7-character token, and that token is the
+whole login. So it is NOT written down here: this repo is public, and anyone
+reading the token could open (and edit) the account. It comes from
+DASHBOARD_TOKEN, set in secret.env locally and as a repo secret in CI. Unset
+means the sync is skipped.
 
 Run:  python sync_dashboard.py
       python sync_dashboard.py --check   (self-check on the mapping, no I/O)
@@ -24,7 +26,17 @@ from pathlib import Path
 
 from build_dashboard import LOG, read_events
 
-TOKEN = "BOT-001"
+# Same plain KEY=VALUE file paper_trader.py reads. Real env vars win, so the
+# CI secret overrides. Read here too because CI runs this as its own process.
+_ENV_FILE = Path(__file__).parent / "secret.env"
+if _ENV_FILE.exists():
+    for _line in _ENV_FILE.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _v = _line.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip().strip("\"'"))
+
+TOKEN = os.environ.get("DASHBOARD_TOKEN", "").strip().upper()
 # The book is a USD paper account at Alpaca, so state it in USD. The dashboard
 # converts to whatever base currency the account asks for anyway.
 BASE_CURRENCY = "USD"
@@ -39,6 +51,20 @@ DEFAULT_LOCAL = (Path(__file__).resolve().parent.parent
 def latest_snapshot(events):
     snaps = [e for e in events if e.get("type") == "snapshot"]
     return snaps[-1] if snaps else None
+
+
+def to_watchlist(snap, decisions):
+    """What the bot is watching right now: what it holds, plus the names it
+    screened this cycle but did not buy.
+
+    This mirrors rather than accumulates. Candidates rotate every cycle, so a
+    union with whatever was there before would grow without bound; this account
+    is the bot's own, so the current view is the whole truth of it.
+    """
+    held = [t for t, p in (snap.get("positions") or {}).items()
+            if float(p.get("shares") or 0) >= DUST_SHARES]
+    candidates = (decisions or {}).get("candidates") or []
+    return sorted({t for t in held + list(candidates) if t})
 
 
 def to_portfolio(snap):
@@ -89,24 +115,31 @@ def push_local(path, portfolio, watchlist):
 
 
 def main():
-    snap = latest_snapshot(read_events(LOG))
+    if not TOKEN:
+        print("sync: DASHBOARD_TOKEN not set, skipped")
+        return
+    events = read_events(LOG)
+    snap = latest_snapshot(events)
     if not snap:
         print("sync: no snapshot in the log yet, nothing to mirror")
         return
     portfolio = to_portfolio(snap)
-    watchlist = [s["ticker"] for s in portfolio["stocks"]]
-    held = ", ".join(watchlist) or "cash only"
+    decisions = [e for e in events if e.get("type") == "decisions"]
+    watchlist = to_watchlist(snap, decisions[-1] if decisions else None)
+    held = ", ".join(s["ticker"] for s in portfolio["stocks"]) or "cash only"
 
     url, key = os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY")
     if url and key:
         push_supabase(url, key, portfolio, watchlist)
-        print(f"sync: pushed {TOKEN} to Supabase ({held})")
+        print(f"sync: pushed {TOKEN} to Supabase "
+              f"({held}; {len(watchlist)} watched)")
         return
 
     local = Path(os.getenv("DASHBOARD_ACCOUNTS") or DEFAULT_LOCAL)
     if local.parent.exists():
         push_local(local, portfolio, watchlist)
-        print(f"sync: wrote {TOKEN} to {local} ({held})")
+        print(f"sync: wrote {TOKEN} to {local} "
+              f"({held}; {len(watchlist)} watched)")
         return
 
     print("sync: no SUPABASE_URL/SUPABASE_KEY and no local dashboard, skipped")
@@ -127,6 +160,13 @@ def check():
     assert set(p) == {"base_currency", "stocks", "crypto", "gold", "banks"}
     # a snapshot with no positions at all still yields a valid account
     assert to_portfolio({"cash": 0})["stocks"] == []
+
+    # the watchlist is what it holds plus what it screened, deduped and sorted,
+    # with the exited and dust names left out
+    wl = to_watchlist(snap, {"candidates": ["INTC", "NVDA", "AAL"]})
+    assert wl == ["AAL", "INTC", "NVDA"], wl
+    assert to_watchlist(snap, None) == ["NVDA"]
+    assert to_watchlist({}, {"candidates": []}) == []
     print("sync_dashboard: checks pass")
 
 

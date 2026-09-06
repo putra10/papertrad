@@ -353,9 +353,12 @@ def render(events, demo=False):
   .banner {{ background:#bf8700; color:#fff; padding:10px 14px;
     border-radius:8px; margin-bottom:18px; font-weight:600; font-size:14px; }}
   .banner code {{ background:rgba(0,0,0,.2); padding:1px 5px; border-radius:4px; }}
-  .tiles {{ display:grid; gap:12px; margin-bottom:22px;
-    grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); }}
-  .tile {{ background:var(--panel); border:1px solid var(--line);
+  /* Flex, not grid: the tile count changes with the number of baselines, and
+     a grid strands the odd one in a half-empty row. Here the basis is small
+     enough that five sit on one row on a laptop, and whatever does wrap grows
+     to fill its row instead of leaving a gap. */
+  .tiles {{ display:flex; flex-wrap:wrap; gap:12px; margin-bottom:22px; }}
+  .tile {{ flex:1 1 150px; background:var(--panel); border:1px solid var(--line);
     border-radius:10px; padding:14px 16px; }}
   .tile h2 {{ font-size:12px; text-transform:uppercase; letter-spacing:.05em;
     color:var(--muted); margin:0 0 6px; font-weight:600; }}
@@ -409,9 +412,10 @@ def render(events, demo=False):
     body {{ padding:14px; }}
     h1 {{ font-size:18px; }}
     .stamp {{ margin-bottom:16px; }}
-    /* 140px lets two tiles sit side by side on a phone instead of five
-       full-width slabs the reader has to scroll past to reach the chart */
-    .tiles {{ gap:10px; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); }}
+    /* a 130px basis lets two tiles sit side by side on a phone instead of
+       five full-width slabs to scroll past before reaching the chart */
+    .tiles {{ gap:10px; }}
+    .tile {{ flex-basis:130px; }}
     .value {{ font-size:20px; }}
     .card {{ padding:12px; margin-bottom:16px; }}
     table {{ font-size:12px; }}

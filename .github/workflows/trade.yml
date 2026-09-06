@@ -71,6 +71,10 @@ jobs:
           APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
           APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          # Mirrors the book into the Dashboard Porto account each cycle.
+          # Unset = the sync prints "skipped" and the session runs unchanged.
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           AUTO_COMMIT: "1"        # push state every cycle, not just at the end
           # Without this Python block-buffers stdout: a cancelled run flushes
           # nothing, so the log looks like the bot never did anything.
@@ -79,6 +83,9 @@ jobs:
 
       - name: Final sync
         if: always()              # still commit if the session errored out
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
           # Every cycle already pushed its own state, so origin is the truth.
           # Reset to it before rebuilding: a run that was queued behind another
@@ -87,6 +94,7 @@ jobs:
           git fetch origin main
           git reset --hard origin/main
           python build_dashboard.py
+          python sync_dashboard.py
           git add -A baseline_state.json trade_log.jsonl docs/
           if git diff --staged --quiet; then
             echo "nothing left to commit"

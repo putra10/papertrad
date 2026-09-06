@@ -856,6 +856,11 @@ def sync_to_git():
         sh("git", "checkout", "-B", "main")
 
     sh("python", "build_dashboard.py")
+    # Mirror the book into the Dashboard Porto account in the same breath, so
+    # the two views never disagree by more than one cycle. It writes to
+    # Supabase (what the deployed dashboard reads) and no-ops without creds.
+    out = sh("python", "sync_dashboard.py")
+    print("  " + ((out.stdout or out.stderr).strip().splitlines() or ["sync: no output"])[-1])
     sh("git", "add", "-A", "baseline_state.json", "trade_log.jsonl", "docs")
     if sh("git", "diff", "--staged", "--quiet").returncode == 0:
         return                                    # nothing changed this cycle

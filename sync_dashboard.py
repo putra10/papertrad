@@ -2,11 +2,13 @@
 Mirror the bot's book into a Dashboard Porto account, so the same positions
 show up there next to the human-managed portfolios.
 
-The dashboard keeps one account per 7-character token, and that token is the
-whole login. So it is NOT written down here: this repo is public, and anyone
-reading the token could open (and edit) the account. It comes from
-DASHBOARD_TOKEN, set in secret.env locally and as a repo secret in CI. Unset
-means the sync is skipped.
+The dashboard keeps one account per 7-character token. It comes from
+DASHBOARD_TOKEN, defined once in build_dashboard.py (which reads secret.env
+locally, the repo secret in CI). Unset means the sync is skipped.
+
+The token is a login, and the published page prints it, so treat this account
+as public: it mirrors what that page already shows, and every cycle overwrites
+whatever is in it. Anything you want to keep belongs under your own token.
 
 Run:  python sync_dashboard.py
       python sync_dashboard.py --check   (self-check on the mapping, no I/O)
@@ -24,19 +26,9 @@ import os
 import sys
 from pathlib import Path
 
+from build_dashboard import DASHBOARD_TOKEN as TOKEN
 from build_dashboard import LOG, read_events
 
-# Same plain KEY=VALUE file paper_trader.py reads. Real env vars win, so the
-# CI secret overrides. Read here too because CI runs this as its own process.
-_ENV_FILE = Path(__file__).parent / "secret.env"
-if _ENV_FILE.exists():
-    for _line in _ENV_FILE.read_text().splitlines():
-        _line = _line.strip()
-        if _line and not _line.startswith("#") and "=" in _line:
-            _k, _v = _line.split("=", 1)
-            os.environ.setdefault(_k.strip(), _v.strip().strip("\"'"))
-
-TOKEN = os.environ.get("DASHBOARD_TOKEN", "").strip().upper()
 # The book is a USD paper account at Alpaca, so state it in USD. The dashboard
 # converts to whatever base currency the account asks for anyway.
 BASE_CURRENCY = "USD"

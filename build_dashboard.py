@@ -10,6 +10,7 @@ No dependencies, no CDN, no JavaScript — GitHub Pages serves the file as-is.
 """
 
 import json
+import os
 import random
 import sys
 from datetime import datetime, timedelta, timezone
@@ -19,6 +20,20 @@ HERE = Path(__file__).parent
 LOG = HERE / "trade_log.jsonl"
 OUT = HERE / "docs" / "index.html"
 WIB = timezone(timedelta(hours=7))       # author is in Indonesia; show both
+
+# The account this bot's book is mirrored into. Read from the same plain
+# KEY=VALUE file paper_trader.py uses, or from the environment (the CI secret),
+# so the token lives in exactly one place; sync_dashboard.py imports it from
+# here. It is printed on the page so the author cannot lose it: the account is
+# a mirror, rewritten every cycle, of what that page already shows.
+_ENV_FILE = HERE / "secret.env"
+if _ENV_FILE.exists():
+    for _line in _ENV_FILE.read_text(encoding="utf-8").splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _v = _line.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip().strip("\"'"))
+DASHBOARD_TOKEN = os.environ.get("DASHBOARD_TOKEN", "").strip().upper()
 SERIES_COLORS = {"bot": "#2f81f7", "SPY": "#8b949e", "QQQ": "#d29922"}
 
 # ----------------------------- DATA ---------------------------------------
@@ -182,6 +197,11 @@ def render(events, demo=False):
         f'<p class="value {"up" if delta > 0 else "down" if delta < 0 else ""}">{value}</p>'
         f'<p class="sub">{sub}</p></div>'
         for label, value, sub, delta in tiles)
+
+    # Printed bare, with no label and no link: it is here so the author does
+    # not lose it, not to tell a passing reader what it opens.
+    token_line = (f' &middot; token <b>{DASHBOARD_TOKEN}</b>'
+                  if DASHBOARD_TOKEN else "")
 
     def cls(v):
         return "up" if v > 0 else "down" if v < 0 else ""
@@ -407,7 +427,7 @@ def render(events, demo=False):
 <div class="wrap">
   {banner}
   <h1>LLM Paper Trading</h1>
-  <p class="stamp">Updated {when_full(latest.get('timestamp'))}</p>
+  <p class="stamp">Updated {when_full(latest.get('timestamp'))}{token_line}</p>
 
   <div class="tiles">{tile_html}</div>
 

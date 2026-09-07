@@ -85,6 +85,12 @@ jobs:
       - name: Final sync
         if: always()              # still commit if the session errored out
         env:
+          # Read-only here: build_dashboard.py asks Alpaca's clock whether
+          # the market is open so the page can say WHY it is idle. This is
+          # the step that runs on holidays and weekends, when the session
+          # above exits in a second, so it is the step that has to say so.
+          APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
+          APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           DASHBOARD_TOKEN: ${{ secrets.DASHBOARD_TOKEN }}
@@ -101,6 +107,8 @@ jobs:
           if git diff --staged --quiet; then
             echo "nothing left to commit"
           else
-            git commit -m "session end $(date -u '+%Y-%m-%d %H:%M UTC')"
+            # Not always a session: on a holiday the step above exits in a
+            # second and this commit carries only the market status.
+            git commit -m "dashboard $(date -u '+%Y-%m-%d %H:%M UTC')"
             git push
           fi

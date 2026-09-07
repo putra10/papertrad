@@ -70,6 +70,34 @@ def build_series(snapshots):
                 series.setdefault(name, []).append((t, float(value)))
     return {k: v for k, v in series.items() if v}
 
+
+def market_now():
+    """Ask Alpaca what the market is doing right now, or None if it cannot.
+
+    The page is static, so on its own it can only report the timestamp of
+    the last cycle -- and a stamp that has not moved since Friday looks
+    exactly like a bot that died. Reading the market at build time is what
+    separates "closed, nothing to do" from "broken".
+
+    All of it is optional. No Alpaca keys in the environment (a local
+    --demo preview, or a CI step that was not handed them) or any failure
+    reaching Alpaca returns None, and the header renders as it always did.
+    A dashboard build must never fail because a quote server is down.
+    """
+    if not (os.environ.get("APCA_API_KEY_ID")
+            and os.environ.get("APCA_API_SECRET_KEY")):
+        return None
+    try:
+        # Imported here rather than at the top: this module is otherwise
+        # pure stdlib and runs offline, and paper_trader needs requests.
+        # It is also the one place that already knows how to tell a
+        # holiday from a weekend, off Alpaca's calendar.
+        import paper_trader
+        return paper_trader.day_context(paper_trader.get_clock())
+    except Exception as e:
+        print(f"  [warn] market status unavailable: {e}")
+        return None
+
 # ----------------------------- RENDER -------------------------------------
 
 def fmt_money(v):
@@ -102,9 +130,47 @@ def when_full(iso):
     return f"{dt.astimezone(WIB):%d %b %Y, %H:%M} WIB"
 
 
+def when_day(iso):
+    """ISO string with any offset -> 'Tue 08 Sep 20:30 WIB'.
+
+    The weekday earns its space here: the only place this is used is a
+    "next open" that can be tomorrow, after a weekend, or after a holiday,
+    and a bare date does not say which.
+    """
+    if not iso:
+        return "n/a"
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return iso
+    return f"{dt.astimezone(WIB):%a %d %b %H:%M} WIB"
+
+
 def clean(text):
     """No em or en dashes on the page, including model-written reasoning."""
     return (text or "").replace("—", "-").replace("–", "-")
+
+
+def market_line(market):
+    """A day_context dict -> the market clause of the header, or "".
+
+    Why "next open" is an absolute time and not "closed now": nothing
+    rebuilds this page over a weekend, so a Saturday reader is looking at
+    Friday evening's build. "Closed" would be stale by then; "next open
+    Mon 08 Sep 20:30 WIB" is still true.
+    """
+    if not market:
+        return ""
+    status = market.get("status") or ""
+    if market.get("market_open"):
+        # day_context words this one itself: "open, 84 min to the close".
+        return f' &middot; <span class="mkt on">{clean("market " + status)}</span>'
+    reason = {"weekend": " for the weekend",
+              "market holiday": " for a holiday"}.get(status, "")
+    text = "market closed" + reason
+    if market.get("next_open"):
+        text += f", next open {when_day(market['next_open'])}"
+    return f' &middot; <span class="mkt off">{clean(text)}</span>'
 
 
 def svg_chart(series, height=300, pad=34, foot=24, vbw=1000):
@@ -167,7 +233,7 @@ def svg_chart(series, height=300, pad=34, foot=24, vbw=1000):
     return "".join(parts)
 
 
-def render(events, demo=False):
+def render(events, demo=False, market=None):
     snapshots = [e for e in events if e.get("type") == "snapshot"]
     orders = [e for e in events if e.get("type") == "order"]
     failed = [e for e in events if e.get("type") == "order_failed"]
@@ -350,6 +416,11 @@ def render(events, demo=False):
   .wrap {{ max-width:1040px; margin:0 auto; }}
   h1 {{ font-size:20px; margin:0 0 2px; }}
   .stamp {{ color:var(--muted); font-size:13px; margin:0 0 20px; }}
+  /* the market clause carries the answer to "why has nothing moved?", so
+     it is the one part of the stamp that is not muted */
+  .mkt {{ font-weight:600; }}
+  .mkt.on {{ color:var(--up); }}
+  .mkt.off {{ color:var(--fg); }}
   .banner {{ background:#bf8700; color:#fff; padding:10px 14px;
     border-radius:8px; margin-bottom:18px; font-weight:600; font-size:14px; }}
   .banner code {{ background:rgba(0,0,0,.2); padding:1px 5px; border-radius:4px; }}
@@ -431,7 +502,7 @@ def render(events, demo=False):
 <div class="wrap">
   {banner}
   <h1>LLM Paper Trading</h1>
-  <p class="stamp">Updated {when_full(latest.get('timestamp'))}{token_line}</p>
+  <p class="stamp">Updated {when_full(latest.get('timestamp'))}{market_line(market)}{token_line}</p>
 
   <div class="tiles">{tile_html}</div>
 
@@ -552,6 +623,25 @@ def selfcheck():
     legacy = render([{"type": "snapshot", "timestamp": "2026-01-01T00:00:00+00:00",
                       "bot_value": 100.0, "held": ["ZZZ"]}])
     assert 'class="held"' in legacy and "ZZZ" in legacy
+    # the market clause: the whole point is that a holiday reads as a
+    # holiday and not as a dead bot, so check each shape day_context emits
+    assert market_line(None) == "", "no status must leave the stamp untouched"
+    holiday = market_line({"market_open": False, "status": "market holiday",
+                           "next_open": "2026-09-08T09:30:00-04:00"})
+    assert "market closed for a holiday" in holiday, holiday
+    assert "next open Tue 08 Sep 20:30 WIB" in holiday, holiday
+    weekend = market_line({"market_open": False, "status": "weekend",
+                           "next_open": "2026-09-08T09:30:00-04:00"})
+    assert "market closed for the weekend" in weekend, weekend
+    after = market_line({"market_open": False, "status": "outside regular hours",
+                         "next_open": "2026-09-08T09:30:00-04:00"})
+    assert "market closed, next open" in after, after
+    live = market_line({"market_open": True, "status": "open, 84 min to the close"})
+    assert "market open, 84 min to the close" in live and "next open" not in live
+    # and it has to land in the header, next to the stamp it explains
+    stamped = render([], market={"market_open": False, "status": "weekend",
+                                 "next_open": "2026-09-08T09:30:00-04:00"})
+    assert "market closed for the weekend" in stamped
     # a failed call must be visible, and its text escaped not executed
     broke = render([{"type": "llm_error", "timestamp": "2026-01-02T00:00:00+00:00",
                      "model": "x/y", "error": "boom <script>alert(1)</script>"}])
@@ -568,7 +658,7 @@ def selfcheck():
                      "candidates": ["BBB"], "decisions": [
                          {"ticker": "BBB", "action": "hold",
                           "reasoning": "choppy — and thin – so passing"}]}])
-    for rendered in (empty, page, holds_only, dashy):
+    for rendered in (empty, page, holds_only, dashy, stamped):
         assert "—" not in rendered and "–" not in rendered, "dash leaked" 
     # a truncated final line must not kill the parse
     tmp = HERE / "_tmp_log.jsonl"
@@ -585,6 +675,9 @@ if __name__ == "__main__":
         sys.exit(0)
     events = demo_events() if demo else read_events(LOG)
     OUT.parent.mkdir(parents=True, exist_ok=True)
-    OUT.write_text(render(events, demo=demo), encoding="utf-8")
+    # Looked up here, not inside render(), so render() stays offline and
+    # pure: the selfcheck calls it a dozen times and must not hit the wire.
+    market = None if demo else market_now()
+    OUT.write_text(render(events, demo=demo, market=market), encoding="utf-8")
     print(f"wrote {OUT}" + ("  (DEMO DATA)" if demo else
                             f"  ({len(events)} events)"))

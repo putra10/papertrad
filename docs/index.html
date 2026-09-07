@@ -19,6 +19,11 @@
   .wrap { max-width:1040px; margin:0 auto; }
   h1 { font-size:20px; margin:0 0 2px; }
   .stamp { color:var(--muted); font-size:13px; margin:0 0 20px; }
+  /* the market clause carries the answer to "why has nothing moved?", so
+     it is the one part of the stamp that is not muted */
+  .mkt { font-weight:600; }
+  .mkt.on { color:var(--up); }
+  .mkt.off { color:var(--fg); }
   .banner { background:#bf8700; color:#fff; padding:10px 14px;
     border-radius:8px; margin-bottom:18px; font-weight:600; font-size:14px; }
   .banner code { background:rgba(0,0,0,.2); padding:1px 5px; border-radius:4px; }
@@ -100,7 +105,7 @@
 <div class="wrap">
   
   <h1>LLM Paper Trading</h1>
-  <p class="stamp">Updated 05 Sep 2026, 02:56 WIB &middot; token <b>V8N-4M5</b></p>
+  <p class="stamp">Updated 05 Sep 2026, 02:56 WIB &middot; <span class="mkt off">market closed for a holiday, next open Tue 08 Sep 20:30 WIB</span> &middot; token <b>V8N-4M5</b></p>
 
   <div class="tiles"><div class="tile"><h2>Bot equity</h2><p class="value up">$102,651.83</p><p class="sub">+2.65% since start</p></div><div class="tile"><h2>Cash in hand</h2><p class="value ">$77,525.25</p><p class="sub">24% of equity deployed</p></div><div class="tile"><h2>vs SPY</h2><p class="value up">+2,090.43</p><p class="sub">SPY at $100,561.40</p></div><div class="tile"><h2>vs QQQ</h2><p class="value up">+1,539.72</p><p class="sub">QQQ at $101,112.11</p></div><div class="tile"><h2>Runs / orders</h2><p class="value ">125 / 107</p><p class="sub">none rejected</p></div></div>
 

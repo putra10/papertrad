@@ -771,10 +771,6 @@ def render(events, demo=False, market=None):
   </details></section>
 
   <footer>
-    <p>Paper money on Alpaca, no real funds. A language model reads prices and
-    headlines every 15 minutes while the US market is open and decides what to
-    buy or sell. It wins only if it ends up ahead of simply holding SPY and QQQ.
-    &ldquo;Worst drop&rdquo; is the deepest fall from a previous high.</p>
     <p>{counts}</p>
   </footer>
 </main>

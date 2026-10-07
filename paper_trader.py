@@ -746,8 +746,21 @@ earnings print, a broken multi-day trend. A price wiggle is not a change.
   the spread, and selling working positions to chase the next idea is
   exactly how this portfolio has lost money so far. If you are near the
   target deployment, a new idea is usually a pass.
-- Do not buy back a name you sold in the last two days, or sell one you
-  bought in the last two days, unless news changed in between.
+- Price can be a reason to act, but read it by size and direction. In the
+  first two days of a position:
+  * Small move against you (under about 3%): hold. That is ordinary daily
+    noise, not a broken thesis. Selling those dips early (typically at
+    -0.8%) has been this portfolio's single biggest loss: -$13.5k.
+  * Real loss (about 5% or more) or news that breaks the thesis: sell
+    without waiting. Cutting a genuine loser early is the point of
+    watching every run.
+  * Moving in your favor: let it run. Early profit-taking here banked about
+    +0.5% a trade, while positions held two days or more earned about
+    +2.1%. Take profit early only on an unusually large move (about 8%+)
+    or news that caps the upside.
+- Buying back a name you just sold is fine when price has proven the sale
+  wrong - it broke above where you sold on a real trend, not a bounce - or
+  news changed. Rebuying a small bounce is just paying the spread twice.
 
 For each ticker you want to act on, give: buy, sell, or hold.
 - If buy: specify dollar amount to allocate (must not exceed available cash

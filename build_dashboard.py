@@ -673,15 +673,11 @@ def render(events, demo=False, market=None):
         for o in items:
             spec = o.get("order") or {}
             side = (spec.get("side") or "").lower()
-            size = (f'{fmt_money(float(spec["notional"]))}' if spec.get("notional") is not None
-                    else f'{float(spec.get("qty") or 0):,.2f} sh')
-            price = o.get("filled_avg_price")
             rows.append(
                 f'<li><span class="t">{when_time(o.get("timestamp"))}</span>'
                 f'<span class="act {esc(side)}">{esc(side.upper())}</span>'
                 f'<b class="tk">{esc(spec.get("symbol", "?"))}</b>'
-                f'<span class="sz">{size}'
-                f'{f" @ {fmt_money(float(price))}" if price else ""}</span>'
+                f'<span class="sz">{trade_size(o)}</span>'
                 f'<p>{esc((o.get("reasoning") or "").strip()) or "-"}</p></li>')
         log_parts.append(f'<h3>{label} <small>({len(rows)})</small></h3>'
                          f'<ul class="trades">{"".join(rows)}</ul>')
@@ -777,6 +773,28 @@ def render(events, demo=False, market=None):
 <script>{CHART_JS}</script>
 </html>
 """
+
+
+def fmt_shares(q):
+    """176.49 sh, but 0.000412 sh: two decimals would show residue as 0.00."""
+    return f"{q:,.2f}" if q >= 1 else f"{q:.6g}"
+
+
+def trade_size(o):
+    """Total, shares and price per share, the same three for every trade.
+
+    Read off the fill, not the request: a buy asks for dollars and a sell
+    for shares, and showing whichever was asked made the rows unalike.
+    """
+    spec = o.get("order") or {}
+    try:
+        qty, px = float(o["filled_qty"]), float(o["filled_avg_price"])
+    except (KeyError, TypeError, ValueError):
+        asked = (fmt_money(float(spec["notional"])) if spec.get("notional") is not None
+                 else f'{fmt_shares(float(spec.get("qty") or 0))} sh')
+        return f'{asked} <i>not filled</i>'
+    return (f'<b>{fmt_money(qty * px)}</b>'
+            f'<span>{fmt_shares(qty)} sh &times; {fmt_money(px)}</span>')
 
 
 def when_time(iso):
@@ -885,6 +903,9 @@ ul.held li{border:1px solid var(--ink);padding:2px 10px;font:700 14px var(--mono
 .trades li{display:grid;grid-template-columns:44px auto auto 1fr;align-items:baseline;column-gap:0}
 .trades .t{font:12px var(--mono);color:var(--faint)}
 .trades .sz{font:13px var(--mono);color:var(--soft);text-align:right}
+.trades .sz b{color:var(--ink);font-weight:600}
+.trades .sz span{margin-left:10px}
+.trades .sz i{font-style:normal;color:var(--down);margin-left:6px}
 .trades p{grid-column:2/-1}
 details{margin-top:14px;border-top:1px solid var(--rule);padding-top:10px}
 summary{cursor:pointer;font-size:14px;color:var(--soft)}
@@ -1228,6 +1249,16 @@ def selfcheck():
     shown = book_section(log)
     assert "Made the most" in shown and "WIN" in shown and "1 to 3 days" in shown
     assert "fills the log missed" in shown, shown
+    # every trade shows total, shares and price per share, from the fill
+    buy = trade_size({"order": {"notional": 20000.0}, "filled_qty": "176.4916",
+                      "filled_avg_price": 113.32})
+    sell = trade_size({"order": {"qty": "176.49"}, "filled_qty": "176.49",
+                       "filled_avg_price": 112.64})
+    assert buy == "<b>$20,000.03</b><span>176.49 sh &times; $113.32</span>", buy
+    assert "<b>$19,879.83</b>" in sell and "176.49 sh &times; $112.64" in sell, sell
+    assert "0.000412 sh" in trade_size({"order": {}, "filled_qty": "0.000412",
+                                        "filled_avg_price": 15.63})
+    assert "not filled" in trade_size({"order": {"notional": 50.0}})
     assert not is_held({"shares": 0.0001, "value": 0.01})
     assert is_held({"shares": 3}) and is_held({"shares": 0.5, "value": 40})
     assert fmt_hours(0.5) == "30m" and fmt_hours(5) == "5h" and fmt_hours(72) == "3.0d"

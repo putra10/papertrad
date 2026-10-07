@@ -6,7 +6,9 @@ Run:  python build_dashboard.py
                                           layout before real runs exist;
                                           also doubles as the self-check)
 
-No dependencies, no CDN, no JavaScript, no web fonts — GitHub Pages serves the file as-is.
+No dependencies, no CDN, no web fonts — GitHub Pages serves the file as-is.
+A small inline script adds the theme toggle and chart zoom and filter; the
+page is complete and readable without it.
 """
 
 import json
@@ -271,7 +273,7 @@ def chart(series, height=300):
     stamps = series["bot"]
     mid = stamps[len(stamps) // 2][0]
     return (
-        f'<div class="chart">'
+        f'<div class="chart" data-chart>'
         f'<div class="plot"><svg viewBox="0 0 1000 {height}" preserveAspectRatio="none" '
         f'role="img" aria-label="Return since start: bot against SPY and QQQ">'
         f'{"".join(grid)}{"".join(paths)}</svg>{"".join(lines)}</div>'
@@ -359,6 +361,170 @@ def verdict(pcts):
     return (f'<h1 class="verdict {tone}">{head}.</h1>', gaps)
 
 
+def is_held(p):
+    """A real holding, not the residue a full sell leaves behind.
+
+    Alpaca can leave a few ten-thousandths of a share after selling
+    everything: above the trader's 1e-6 dust line, but worth a cent. Older
+    snapshots carry no value, so they are judged on shares alone.
+    """
+    return (float(p.get("shares") or 0) >= 1e-6
+            and float(p.get("value", 1) or 0) >= 1)
+
+
+HOLD_BUCKETS = ((1, "Under 1 hour"), (24, "1 hour to 1 day"),
+                (72, "1 to 3 days"), (float("inf"), "3 days or more"))
+
+
+def ticker_book(events):
+    """Replay the logged fills: P&L and holding time per ticker.
+
+    Returns (rows, trips, unlogged). Snapshots are the truth about what is
+    held: when one no longer shows a name the replay still carries, that
+    exit never reached the log (fills lost to cancelled runs and merge
+    conflicts). The leftover is dropped rather than guessed at, and whatever
+    it cost shows up in `unlogged`, the part of the equity change that no
+    logged trade explains.
+    """
+    pos, book, trips = {}, {}, []
+    latest = None
+    for e in events:                                     # already time-sorted
+        kind = e.get("type")
+        if kind == "snapshot" and "positions" in e:
+            latest = e
+            held = {s for s, p in e["positions"].items()
+                    if is_held(p)}
+            for sym in [s for s in pos if s not in held]:
+                # unlogged exit: the hold ended within one cycle of this
+                # snapshot, so its length is known; its P&L only in part
+                p = pos.pop(sym)
+                b = book[sym]
+                hours = (datetime.fromisoformat(e["timestamp"].replace("Z", "+00:00"))
+                         - p["since"]).total_seconds() / 3600
+                b["holds"].append(hours)
+                b["wins"] += p["pnl"] > 0
+                trips.append((hours, p["pnl"]))
+            continue
+        if kind != "order" or not e.get("filled_avg_price"):
+            continue
+        spec = e.get("order") or {}
+        sym, side = spec.get("symbol"), spec.get("side")
+        try:
+            qty, px = float(e.get("filled_qty") or 0), float(e["filled_avg_price"])
+            ts = datetime.fromisoformat(e["timestamp"].replace("Z", "+00:00"))
+        except (KeyError, TypeError, ValueError):
+            continue
+        b = book.setdefault(sym, {"pnl": 0.0, "holds": [], "wins": 0, "open": None})
+        p = pos.get(sym)
+        if side == "buy":
+            if not p:
+                p = pos[sym] = {"sh": 0.0, "cost": 0.0, "since": ts, "pnl": 0.0}
+            p["sh"] += qty
+            p["cost"] += qty * px
+        elif p and p["sh"] > 0:
+            qty = min(qty, p["sh"])
+            avg = p["cost"] / p["sh"]
+            p["pnl"] += (px - avg) * qty
+            b["pnl"] += (px - avg) * qty
+            p["sh"] -= qty
+            p["cost"] -= avg * qty
+            if p["sh"] < 1e-4:                          # round trip closed
+                hours = (ts - p["since"]).total_seconds() / 3600
+                b["holds"].append(hours)
+                b["wins"] += p["pnl"] > 0
+                trips.append((hours, p["pnl"]))
+                del pos[sym]
+    if latest:
+        now = datetime.fromisoformat(latest["timestamp"].replace("Z", "+00:00"))
+        for sym, lp in latest["positions"].items():
+            if not is_held(lp):
+                continue
+            b = book.setdefault(sym, {"pnl": 0.0, "holds": [], "wins": 0, "open": None})
+            b["pnl"] += float(lp.get("pl") or 0)
+            since = (pos.get(sym) or {}).get("since")
+            b["open"] = (now - since).total_seconds() / 3600 if since else 0.0
+    rows = sorted(({"sym": s, **b} for s, b in book.items()),
+                  key=lambda r: r["pnl"], reverse=True)
+    unlogged = None
+    if latest:
+        start = next((float(e["bot_value"]) for e in events
+                      if e.get("type") == "snapshot" and e.get("bot_value")), None)
+        if start:
+            unlogged = float(latest["bot_value"]) - start - sum(r["pnl"] for r in rows)
+    return rows, trips, unlogged
+
+
+def fmt_hours(h):
+    if h is None:
+        return "-"
+    if h < 1:
+        return f"{h * 60:.0f}m"
+    return f"{h:.0f}h" if h < 48 else f"{h / 24:.1f}d"
+
+
+def book_section(events):
+    rows, trips, unlogged = ticker_book(events)
+    if not rows:
+        return '<p class="empty">Fills in once the bot has traded.</p>'
+    # how long it holds, and what each length of hold has earned
+    brows = []
+    for (cap, label), lo in zip(HOLD_BUCKETS, (0,) + tuple(c for c, _ in HOLD_BUCKETS)):
+        got = [p for h, p in trips if lo <= h < cap]
+        if not got:
+            continue
+        net = sum(got)
+        brows.append(
+            f'<tr><th scope="row">{label}</th><td class="num">{len(got)}</td>'
+            f'<td class="num">{sum(p > 0 for p in got) / len(got):.0%}</td>'
+            f'<td class="num {"up" if net > 0 else "down"}">{fmt_delta(net)}</td></tr>')
+    counts = [(label, sum(lo <= h < cap for h, _ in trips))
+              for (cap, label), lo in zip(HOLD_BUCKETS, (0,) + tuple(c for c, _ in HOLD_BUCKETS))]
+    usual = max(counts, key=lambda c: c[1])[0].lower() if trips else ""
+    holds_html = (
+        f'<p class="note">{len(trips)} closed trades. Most were held '
+        f'<b>{usual}</b>.</p>'
+        '<table class="tbl"><thead><tr><th>Held for</th><th class="num">Trades</th>'
+        '<th class="num">Won</th><th class="num">Net P&amp;L</th></tr></thead>'
+        f'<tbody>{"".join(brows)}</tbody></table>' if trips else "")
+
+    big = max(abs(r["pnl"]) for r in rows) or 1
+
+    def line(r):
+        n = len(r["holds"])
+        med = sorted(r["holds"])[n // 2] if n else None
+        bits = []
+        if n:
+            bits.append(f'{n} trade{"s" if n != 1 else ""}, typically held {fmt_hours(med)}, '
+                        f'{r["wins"]} won')
+        if r["open"] is not None:
+            bits.append(f'holding now ({fmt_hours(r["open"])})')
+        w = abs(r["pnl"]) / big * 50
+        side = "win" if r["pnl"] >= 0 else "loss"
+        return (f'<li><b class="tk">{esc(r["sym"])}</b>'
+                f'<span class="dv"><i class="{side}" style="width:{w:.1f}%"></i></span>'
+                f'<span class="num {"up" if r["pnl"] > 0 else "down" if r["pnl"] < 0 else ""}">'
+                f'{fmt_delta(r["pnl"])}</span>'
+                f'<small>{"; ".join(bits)}</small></li>')
+
+    top = [r for r in rows if r["pnl"] > 0][:6]
+    worst = [r for r in reversed(rows) if r["pnl"] < 0][:6]
+    rest = [r for r in rows if r not in top and r not in worst]
+    html = holds_html
+    html += ('<h3>Made the most</h3><ul class="book">' + "".join(map(line, top)) + "</ul>"
+             if top else "")
+    html += ('<h3>Lost the most</h3><ul class="book">' + "".join(map(line, worst)) + "</ul>"
+             if worst else "")
+    if rest:
+        html += (f'<details><summary>The other {len(rest)} tickers</summary>'
+                 f'<ul class="book">{"".join(map(line, rest))}</ul></details>')
+    if unlogged is not None and abs(unlogged) >= 1:
+        html += (f'<p class="note">Net P&amp;L counts closed trades plus what is open '
+                 f'now. Another <b class="{"up" if unlogged > 0 else "down"}">'
+                 f'{fmt_delta(unlogged)}</b> of the account&rsquo;s change came from '
+                 f'fills the log missed, so it is not pinned on any ticker.</p>')
+    return html
+
+
 def render(events, demo=False, market=None):
     snapshots = [e for e in events if e.get("type") == "snapshot"]
     orders = [e for e in events if e.get("type") == "order"]
@@ -402,7 +568,7 @@ def render(events, demo=False, market=None):
     # holdings
     cash = latest.get("cash")
     positions = {s: p for s, p in (latest.get("positions") or {}).items()
-                 if float(p.get("shares") or 0) >= 1e-6}
+                 if is_held(p)}
     opened = opened_at(orders, set(positions))
     if positions:
         hrows = []
@@ -522,6 +688,15 @@ def render(events, demo=False, market=None):
     log_html = "".join(log_parts) or '<p class="empty">No orders yet.</p>'
 
     closes = session_closes(series)
+    # the chart's raw readings, for the zoom and filter script; aligned by
+    # snapshot, null where a series has no reading
+    snaps = [s for s in snapshots if s.get("bot_value") is not None]
+    chart_data = json.dumps({
+        "t": [s.get("timestamp") for s in snaps],
+        **{name: [(s.get("baselines") or {}).get(name) if name != "bot"
+                  else s.get("bot_value") for s in snaps]
+           for name in series},
+    }, separators=(",", ":")).replace("</", "<\\/")
     token_line = (f' &middot; token <b>{DASHBOARD_TOKEN}</b>' if DASHBOARD_TOKEN else "")
     banner = ('<div class="banner">DEMO DATA. Synthetic, generated by '
               '<code>--demo</code> to preview the layout. Not real results.</div>'
@@ -535,11 +710,13 @@ def render(events, demo=False, market=None):
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <title>Bot vs Market</title>
+<script>{HEAD_JS}</script>
 <style>{CSS}</style>
 <main>
   {banner}
   <header class="mast">
-    <p class="kicker">LLM paper trader &middot; scored against buy-and-hold</p>
+    <p class="kicker">LLM paper trader &middot; scored against buy-and-hold
+      <button type="button" class="theme" id="theme" aria-label="Colour theme">Theme: auto</button></p>
     <p class="stamp">Updated {when_full(latest.get('timestamp'))}{market_line(market)}{token_line}</p>
   </header>
 
@@ -557,7 +734,14 @@ def render(events, demo=False, market=None):
 
   <section>
     <h2>Return since the start</h2>
+    <div class="controls" role="group" aria-label="Chart range and lines">
+      <span class="seg" id="range"><button data-days="1" aria-pressed="false">1D</button><button data-days="7" aria-pressed="false">1W</button><button data-days="30" aria-pressed="false">1M</button><button data-days="0" aria-pressed="true">All</button></span>
+      <span class="seg" id="lines"><button data-s="bot" aria-pressed="true" class="k-bot">Bot</button><button data-s="QQQ" aria-pressed="true" class="k-qqq">QQQ</button><button data-s="SPY" aria-pressed="true" class="k-spy">SPY</button></span>
+    </div>
     {chart(series)}
+    <p class="note hint">Drag across the chart to zoom in, tap or hover for values. Returns
+    are measured from the left edge of whatever range is showing.</p>
+    <script type="application/json" id="chart-data">{chart_data}</script>
   </section>
 
   <section>
@@ -570,25 +754,27 @@ def render(events, demo=False, market=None):
     {held_html}
   </section>
 
-  <section>
-    <h2>Its latest decision</h2>
-    {think_html}
-  </section>
+  <section><details class="fold" open>
+    <summary><h2>Where the money came from</h2></summary>
+    {book_section(events)}
+  </details></section>
 
-  <section>
-    <h2>Trades</h2>
+  <section><details class="fold" open>
+    <summary><h2>Its latest decision</h2></summary>
+    {think_html}
+  </details></section>
+
+  <section><details class="fold" open>
+    <summary><h2>Trades</h2></summary>
     <p class="note">Most recent 40, grouped by US trading day. Times in WIB.</p>
     {log_html}
-  </section>
+  </details></section>
 
   <footer>
-    <p>Paper money on Alpaca, no real funds. A language model reads prices and
-    headlines every 15 minutes while the US market is open and decides what to
-    buy or sell. It wins only if it ends up ahead of simply holding SPY and QQQ.
-    &ldquo;Worst drop&rdquo; is the deepest fall from a previous high.</p>
     <p>{counts}</p>
   </footer>
 </main>
+<script>{CHART_JS}</script>
 </html>
 """
 
@@ -600,6 +786,13 @@ def when_time(iso):
         return ""
 
 
+# Light is the default. Dark follows the device unless the reader picked a
+# theme with the toggle, which sets data-theme on <html>.
+_DARK = """
+  --paper:#14130f; --sheet:#1b1a15; --ink:#ece7da; --soft:#b7b0a2; --faint:#857f73;
+  --rule:#36332b; --up:#62c48a; --down:#ef7a6c; --bot:#ff7f45; --qqq:#82a6ff; --spy:#a49e91;
+  color-scheme:dark;"""
+
 CSS = """
 :root{
   --paper:#f3efe6; --sheet:#faf8f2; --ink:#1c1a16; --soft:#57524a; --faint:#8a8478;
@@ -607,11 +800,10 @@ CSS = """
   --serif:"Iowan Old Style","Palatino Linotype",Palatino,"Book Antiqua",Georgia,serif;
   --mono:ui-monospace,"SF Mono","Cascadia Mono",Consolas,"Liberation Mono",monospace;
   --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  color-scheme:light;
 }
-@media (prefers-color-scheme:dark){:root{
-  --paper:#14130f; --sheet:#1b1a15; --ink:#ece7da; --soft:#b7b0a2; --faint:#857f73;
-  --rule:#36332b; --up:#62c48a; --down:#ef7a6c; --bot:#ff7f45; --qqq:#82a6ff; --spy:#a49e91;
-}}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){""" + _DARK + """}}
+:root[data-theme=dark]{""" + _DARK + """}
 *{box-sizing:border-box}
 html{background:var(--paper)}
 body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.55 var(--sans);
@@ -703,6 +895,52 @@ pre{font:12px/1.5 var(--mono);white-space:pre-wrap;word-break:break-word;backgro
   border:1px solid var(--rule);padding:12px;margin:8px 0 0;max-height:420px;overflow:auto}
 .alert{border:2px solid var(--down);padding:14px;margin-top:22px}
 .alert h2{color:var(--down)}
+.theme{float:right;font:500 12px var(--sans);letter-spacing:0;text-transform:none;color:var(--ink);
+  background:none;border:1px solid var(--rule);padding:1px 8px;cursor:pointer;display:none}
+.js .theme{display:inline-block}
+.controls{display:none;flex-wrap:wrap;gap:8px 14px;margin:0 0 12px}
+.js .controls{display:flex}
+.seg{display:inline-flex;border:1px solid var(--ink)}
+.seg button{font:600 12px var(--mono);background:none;color:var(--soft);border:0;
+  border-left:1px solid var(--rule);padding:5px 11px;cursor:pointer;min-height:30px}
+.seg button:first-child{border-left:0}
+.seg button[aria-pressed=true]{background:var(--ink);color:var(--paper)}
+#lines button[aria-pressed=false]{text-decoration:line-through;opacity:.6}
+#lines button.k-bot[aria-pressed=true]{background:var(--bot);color:var(--paper)}
+#lines button.k-qqq[aria-pressed=true]{background:var(--qqq);color:var(--paper)}
+#lines button.k-spy[aria-pressed=true]{background:var(--spy);color:var(--paper)}
+.hint{display:none;margin-top:10px}.js .hint{display:block}
+.plot{touch-action:pan-y;cursor:crosshair;user-select:none;-webkit-user-select:none}
+.cur{position:absolute;top:0;bottom:0;width:0;border-left:1px solid var(--soft);pointer-events:none}
+.tip{position:absolute;top:6px;background:var(--paper);border:1px solid var(--ink);padding:6px 9px;
+  font:12px/1.5 var(--mono);white-space:nowrap;pointer-events:none;z-index:2}
+.tip b{font-family:var(--sans)}
+.brush{position:absolute;top:0;bottom:0;background:var(--ink);opacity:.1;pointer-events:none}
+.tbl{width:100%;border-collapse:collapse;margin-bottom:6px}
+.tbl th,.tbl td{padding:8px 0 8px 12px;border-top:1px solid var(--rule);text-align:left}
+.tbl thead th{border-top:0;padding-top:0;font:600 11px var(--sans);letter-spacing:.08em;
+  text-transform:uppercase;color:var(--faint)}
+.tbl th:first-child{padding-left:0;font-weight:500}
+.tbl .num{text-align:right}
+.book li{display:grid;grid-template-columns:64px 1fr 96px;align-items:center;column-gap:10px;
+  padding:8px 0;border-top:1px solid var(--rule)}
+.book li:first-child{border-top:0}
+.book small{grid-column:1/-1;color:var(--soft);font-size:13px;margin-top:2px}
+.dv{position:relative;height:12px}
+.dv::before{content:"";position:absolute;left:50%;top:-4px;bottom:-4px;border-left:1px solid var(--faint)}
+.dv i{position:absolute;top:0;bottom:0}
+.dv i.win{left:50%;background:var(--up)}.dv i.loss{right:50%;background:var(--down)}
+/* the lower sections fold away under their own heading */
+details.fold{margin:0;border:0;padding:0}
+.fold>summary{list-style:none;display:flex;align-items:center;justify-content:space-between;
+  color:var(--ink);padding:2px 0}
+.fold>summary::-webkit-details-marker{display:none}
+.fold>summary h2{margin:0}
+.fold>summary::after{content:"Hide";font:500 12px var(--sans);color:var(--soft);
+  border:1px solid var(--rule);padding:1px 8px}
+.fold:not([open])>summary::after{content:"Show"}
+.fold[open]>summary{margin-bottom:14px}
+.fold>summary:focus-visible{outline:2px solid var(--ink);outline-offset:3px}
 footer{padding-top:20px;font-size:13px;color:var(--soft)}
 footer p{margin:0 0 8px;max-width:66ch}
 @media (max-width:600px){
@@ -719,6 +957,137 @@ footer p{margin:0 0 8px;max-width:66ch}
   .trades li{grid-template-columns:40px auto 1fr}
   .trades .sz{grid-column:2/-1;text-align:left;margin-top:2px}
 }
+"""
+
+
+
+# Runs before first paint: apply a saved theme so the page never flashes the
+# wrong colours, and mark that scripts work so the controls show.
+HEAD_JS = """
+try{var t=localStorage.getItem('theme');if(t)document.documentElement.dataset.theme=t}catch(e){}
+document.documentElement.classList.add('js');
+"""
+
+# The static page is complete without this. It only adds the theme toggle,
+# and range, line and drag-to-zoom controls on the return chart, redrawing
+# the same markup chart() writes.
+CHART_JS = r"""
+(function(){
+var root=document.documentElement, btn=document.getElementById('theme');
+var modes=['auto','light','dark'];
+function showTheme(){btn.textContent='Theme: '+(root.dataset.theme||'auto')}
+btn.onclick=function(){
+  var m=modes[(modes.indexOf(root.dataset.theme||'auto')+1)%3];
+  if(m==='auto')delete root.dataset.theme;else root.dataset.theme=m;
+  try{m==='auto'?localStorage.removeItem('theme'):localStorage.setItem('theme',m)}catch(e){}
+  showTheme();
+};
+showTheme();
+
+var src=document.getElementById('chart-data'), box=document.querySelector('[data-chart]');
+if(!src||!box)return;
+var D=JSON.parse(src.textContent), N=D.t.length;
+if(N<2)return;
+var H=300, ORDER=['SPY','QQQ','bot'], LABEL={bot:'Bot',QQQ:'QQQ',SPY:'SPY'};
+var on={bot:true,QQQ:true,SPY:true}, i0=0, i1=N-1, view=null;
+var T=D.t.map(function(s){return Date.parse(s)});
+var MON=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+// axis dates are US session dates (UTC), the same as the static chart
+function day(i){var d=new Date(T[i]);return ('0'+d.getUTCDate()).slice(-2)+' '+MON[d.getUTCMonth()]}
+function stamp(i){var d=new Date(T[i]+7*36e5);                 // WIB is UTC+7, no DST
+  return ('0'+d.getUTCDate()).slice(-2)+' '+MON[d.getUTCMonth()]+', '+('0'+d.getUTCHours()).slice(-2)+':'+('0'+d.getUTCMinutes()).slice(-2)+' WIB'}
+function pct(v){return (v>=0?'+':'')+v.toFixed(2)+'%'}
+function niceStep(span){var s=[.05,.1,.25,.5,1,2,2.5,5,10,20,25,50];for(var k=0;k<s.length;k++)if(span/s[k]<=6)return s[k];return 100}
+
+function draw(){
+  var S={}, vals=[0];
+  ORDER.forEach(function(n){
+    if(!on[n]||!D[n])return;
+    var base=null, out=[];
+    for(var i=i0;i<=i1;i++){var v=D[n][i];if(v!=null&&base==null)base=v;out.push(v==null||!base?null:(v/base-1)*100)}
+    S[n]=out; out.forEach(function(v){if(v!=null)vals.push(v)});
+  });
+  var lo=Math.min.apply(null,vals), hi=Math.max.apply(null,vals), sp=(hi-lo)||1;
+  lo-=sp*.06; hi+=sp*.06;
+  var st=niceStep(hi-lo), m=Math.max(i1-i0,1);
+  function y(v){return (hi-v)/(hi-lo)*100}
+  var svg='', ticks='', ends=[];
+  for(var k=Math.ceil(lo/st);k*st<=hi;k++){
+    var t=k*st, yy=y(t), yp=(yy*H/100).toFixed(1), z=Math.abs(t)<1e-9;
+    svg+='<line x1="0" x2="1000" y1="'+yp+'" y2="'+yp+'" class="'+(z?'zero':'grid')+'"/>';
+    ticks+='<span class="ytick'+(z?' zero':'')+'" style="top:'+yy.toFixed(2)+'%">'+(z?'0%':(t>0?'+':'')+(+t.toFixed(2))+'%')+'</span>';
+  }
+  Object.keys(S).forEach(function(n){
+    var pts=[], last=null;
+    S[n].forEach(function(v,j){if(v!=null){pts.push((1000*j/m).toFixed(1)+','+(y(v)*H/100).toFixed(1));last=v}});
+    svg+='<polyline class="ln ln-'+n.toLowerCase()+'" points="'+pts.join(' ')+'"/>';
+    if(last!=null)ends.push([y(last),n,last]);
+  });
+  ends.sort(function(a,b){return a[0]-b[0]});
+  for(var e=1;e<ends.length;e++)ends[e][0]=Math.max(ends[e][0],ends[e-1][0]+9);
+  var plot=box.querySelector('.plot');
+  plot.innerHTML='<svg viewBox="0 0 1000 '+H+'" preserveAspectRatio="none" role="img" aria-label="Return over the selected range">'+svg+'</svg>'+ticks;
+  box.querySelector('.rail').innerHTML=ends.map(function(e){
+    return '<span class="end end-'+e[1].toLowerCase()+'" style="top:'+e[0].toFixed(2)+'%"><b>'+LABEL[e[1]]+'</b> '+pct(e[2])+'</span>'}).join('');
+  box.querySelector('.xaxis').innerHTML='<span>'+day(i0)+'</span><span>'+day(Math.round((i0+i1)/2))+'</span><span>'+day(i1)+'</span>';
+  view={S:S,m:m};
+  cur=tip=null;
+}
+
+function setRange(days){
+  i1=N-1; i0=0;
+  if(days){var cut=T[N-1]-days*864e5;while(i0<N-2&&T[i0]<cut)i0++}
+  document.querySelectorAll('#range button').forEach(function(b){b.setAttribute('aria-pressed',String(+b.dataset.days===days))});
+  draw();
+}
+document.querySelectorAll('#range button').forEach(function(b){b.onclick=function(){setRange(+b.dataset.days)}});
+document.querySelectorAll('#lines button').forEach(function(b){b.onclick=function(){
+  var n=b.dataset.s, left=Object.keys(on).filter(function(k){return on[k]&&D[k]}).length;
+  if(on[n]&&left===1)return;                       // keep at least one line
+  on[n]=!on[n]; b.setAttribute('aria-pressed',String(on[n])); draw();
+}});
+
+// hover or tap for values, drag across to zoom
+var plotEl=box.querySelector('.plot'), drag=null, brush=null, cur=null, tip=null;
+function frac(ev){var r=plotEl.getBoundingClientRect();return Math.min(Math.max((ev.clientX-r.left)/r.width,0),1)}
+function clearHover(){if(cur){cur.remove();cur=null}if(tip){tip.remove();tip=null}}
+function hover(f){
+  if(!view)return;
+  var j=Math.round(f*view.m), i=i0+j, x=j/view.m*100;
+  if(!cur){cur=document.createElement('div');cur.className='cur';tip=document.createElement('div');tip.className='tip';
+    plotEl.appendChild(cur);plotEl.appendChild(tip)}
+  cur.style.left=x+'%';
+  tip.innerHTML=stamp(i)+Object.keys(view.S).slice().reverse().map(function(n){
+    var v=view.S[n][j];return v==null?'':'<br><b>'+LABEL[n]+'</b> '+pct(v)}).join('');
+  tip.style.left=f>0.55?'':(x+2)+'%';
+  tip.style.right=f>0.55?(100-x+2)+'%':'';
+}
+plotEl.addEventListener('pointerdown',function(ev){if(!ev.button)drag={f:frac(ev),x:ev.clientX}});
+plotEl.addEventListener('pointermove',function(ev){
+  var f=frac(ev);
+  if(drag&&Math.abs(ev.clientX-drag.x)>8){
+    clearHover();
+    if(!brush){brush=document.createElement('div');brush.className='brush';plotEl.appendChild(brush)}
+    brush.style.left=Math.min(f,drag.f)*100+'%'; brush.style.width=Math.abs(f-drag.f)*100+'%';
+  }else hover(f);
+});
+function endDrag(ev){
+  if(!drag)return;
+  if(brush){
+    var a=Math.min(drag.f,frac(ev)), b=Math.max(drag.f,frac(ev)), m=i1-i0;
+    var n0=i0+Math.round(a*m), n1=i0+Math.round(b*m);
+    brush.remove();brush=null;
+    if(n1-n0>=3){i0=n0;i1=n1;
+      document.querySelectorAll('#range button').forEach(function(x){x.setAttribute('aria-pressed','false')});
+      draw()}
+  }
+  drag=null;
+}
+plotEl.addEventListener('pointerup',endDrag);
+plotEl.addEventListener('pointercancel',function(){drag=null;if(brush){brush.remove();brush=null}});
+plotEl.addEventListener('pointerleave',function(ev){if(ev.pointerType==='mouse'){endDrag(ev);clearHover()}});
+draw();
+})();
 """
 
 # ----------------------------- ENTRY --------------------------------------
@@ -794,8 +1163,20 @@ def selfcheck():
     page = render(demo_events(), demo=True)
     # one stretching chart, one line per series, labels in HTML so they keep
     # their size and place at any width
-    assert page.count("<polyline") == 3, "expected one line per series"
-    assert page.count("<svg") == 1 and 'preserveAspectRatio="none"' in page
+    markup = page.split(CHART_JS)[0]          # the script quotes the same tags
+    assert page.count(CHART_JS) == 1 and page.count(HEAD_JS) == 1
+    assert markup.count("<polyline") == 3, "expected one line per series"
+    assert markup.count("<svg") == 1 and 'preserveAspectRatio="none"' in markup
+    # the zoom script gets every reading, and nothing in it can close the tag
+    data = json.loads(markup.split('id="chart-data">')[1].split("</script>")[0])
+    assert len(data["t"]) == len(data["bot"]) == 40 and {"SPY", "QQQ"} <= set(data)
+    for must in ("Theme: auto", 'data-days="7"', 'data-s="QQQ"', "Drag across",
+                 'data-theme=dark', "Where the money came from"):
+        assert must in page, must
+    # everything below the holdings folds, and starts open
+    lower = markup.split("What it holds now")[1]
+    assert lower.count('<details class="fold" open>') == 3
+    assert markup.split("What it holds now")[0].count('class="fold"') == 0
     assert "@media (max-width:600px)" in page and 'name="viewport"' in page
     for must in ("DEMO DATA", "vs SPY", "vs QQQ", "NVDA", "HOLD",
                  "Its latest decision", "Raw model response", "Model thinking",
@@ -819,6 +1200,37 @@ def selfcheck():
     ahead = render([snap("2026-01-01T15:00:00+00:00", 100, 100, 100),
                     snap("2026-01-02T15:00:00+00:00", 110, 101, 106)])
     assert "Beating the market." in ahead and "1 of 1</b> sessions won" in ahead
+    # per-ticker replay: P&L, hold time, and the exit the log never saw
+    def ev(t, kind, **kw):
+        return {"type": kind, "timestamp": f"2026-01-0{t}T15:00:00+00:00", **kw}
+    def fill(t, sym, side, qty, px, hh="15"):
+        return {"type": "order", "timestamp": f"2026-01-0{t}T{hh}:00:00+00:00",
+                "order": {"symbol": sym, "side": side}, "filled_qty": str(qty),
+                "filled_avg_price": px}
+    log = [ev(1, "snapshot", bot_value=1000.0, positions={}),
+           fill(1, "WIN", "buy", 10, 10.0, "16"), fill(3, "WIN", "sell", 10, 12.0, "16"),
+           fill(1, "GONE", "buy", 5, 20.0, "16"),
+           # GONE was sold, but the sell never reached the log
+           ev(2, "snapshot", bot_value=990.0, positions={"WIN": {"shares": 10}}),
+           fill(4, "OPEN", "buy", 2, 50.0, "14"),
+           ev(4, "snapshot", bot_value=1015.0, positions={
+               "OPEN": {"shares": 2, "pl": -3.0}})]
+    log.sort(key=lambda e: e["timestamp"])    # as read_events delivers it
+    rows, trips, unlogged = ticker_book(log)
+    by = {r["sym"]: r for r in rows}
+    assert by["WIN"]["pnl"] == 20 and by["WIN"]["holds"] == [48.0], by["WIN"]
+    assert by["OPEN"]["pnl"] == -3 and by["OPEN"]["open"] == 1.0, by["OPEN"]
+    # GONE's hold ends at the snapshot that no longer shows it; its P&L is
+    # the part the log cannot see
+    assert by["GONE"]["pnl"] == 0 and by["GONE"]["holds"] == [23.0], by["GONE"]
+    assert sorted(trips) == [(23.0, 0.0), (48.0, 20.0)], trips
+    assert round(unlogged, 2) == -2.0, unlogged
+    shown = book_section(log)
+    assert "Made the most" in shown and "WIN" in shown and "1 to 3 days" in shown
+    assert "fills the log missed" in shown, shown
+    assert not is_held({"shares": 0.0001, "value": 0.01})
+    assert is_held({"shares": 3}) and is_held({"shares": 0.5, "value": 40})
+    assert fmt_hours(0.5) == "30m" and fmt_hours(5) == "5h" and fmt_hours(72) == "3.0d"
     # old snapshots carry tickers only; they must still render as chips
     legacy = render([{"type": "snapshot", "timestamp": "2026-01-01T00:00:00+00:00",
                       "bot_value": 100.0, "held": ["ZZZ"]}])

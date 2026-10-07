@@ -55,11 +55,15 @@ THIS ONLY EVER TALKS TO THE PAPER ENDPOINT. NOT FINANCIAL ADVICE.
 import json
 import math
 import os
+import re
 import sys
 import time
 import traceback
+import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
+from urllib.parse import quote_plus
 
 import requests
 
@@ -100,6 +104,25 @@ NEWS_LIMIT = 50            # Alpaca's hard maximum -- 60 is a 400 and the whole
 EARNINGS_WORDS = ("earnings", "eps", "quarterly result", "quarter result",
                   "guidance", "outlook", "forecast", "revenue", "beats",
                   "misses", "reports q", "results for", "profit")
+# Alpaca's feed is Benzinga alone, and Benzinga tags market chatter onto every
+# name it mentions. A headline tagging this many names in the pool is a
+# roundup ("stocks moving premarket"), not news about any one of them.
+ROUNDUP_TICKERS = 3
+
+# Second opinion on each name: Google News search, restricted to major
+# outlets. Free, no key, every publisher in one feed. Searched by company
+# name, because a bare symbol like NU or PATH matches everything.
+RSS_OUTLETS = ("bloomberg.com", "reuters.com", "cnbc.com", "wsj.com", "ft.com",
+               "marketwatch.com", "barrons.com", "apnews.com")
+RSS_PER_TICKER = 5
+# Market backdrop: Bloomberg's own markets feed. Market-wide, so it gets its
+# own small block and is never mistaken for news about a held name.
+MARKET_FEED = "https://feeds.bloomberg.com/markets/news.rss"
+MARKET_HEADLINES = 6
+RSS_UA = "Mozilla/5.0 (papertrad paper-trading bot)"
+
+# The model's memory between runs: its own last few trades and why.
+RECENT_TRADES_SHOWN = 10
 
 # OpenRouter model, $/M tokens in/out as of 2026-08. The script does the
 # trading; the model only has to return the JSON, so cheap is fine.
@@ -255,41 +278,74 @@ def day_context(clock):
     }
 
 
-def holding_days(symbols):
-    """symbol -> days since the buy that opened the position, from our log.
+def _log_events(kind):
+    """Events of one type from our log, oldest first.
 
-    Alpaca exposes no entry date on a position, so it is read back out of
-    trade_log.jsonl. A swing bot needs to know it has been sitting in
-    something for two weeks; None just means the log does not go back far
-    enough.
+    Sorted by timestamp, not file order: end-of-session git merges can land a
+    later cycle's lines ahead of earlier ones.
     """
-    # ponytail: any sell restarts the clock, even a partial trim. Track
-    # per-lot entries only if partial exits ever become common.
-    opened = {}
     if not LOG_FILE.exists():
-        return {}
+        return []
+    out = []
     for line in LOG_FILE.read_text(encoding="utf-8").splitlines():
         try:
             e = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if e.get("type") != "order":
-            continue
+        if e.get("type") == kind:
+            out.append(e)
+    return sorted(out, key=lambda e: e.get("timestamp") or "")
+
+
+def holding_days(symbols):
+    """symbol -> {"days": since the opening buy, "thesis": why it was bought}.
+
+    Alpaca exposes no entry date on a position, so it is read back out of
+    trade_log.jsonl. The thesis is the model's own reasoning on that buy, so
+    it judges a position against why it bought it, not against today's mood.
+    """
+    # ponytail: any sell restarts the clock, even a partial trim. Track
+    # per-lot entries only if partial exits ever become common.
+    opened = {}
+    for e in _log_events("order"):
         sym = (e.get("order") or {}).get("symbol")
         if sym not in symbols:
             continue
         if (e.get("order") or {}).get("side") == "sell":
             opened.pop(sym, None)
         else:
-            opened.setdefault(sym, e.get("timestamp"))
+            opened.setdefault(sym, e)
     now = datetime.now(timezone.utc)
     out = {}
-    for sym, ts in opened.items():
+    for sym, e in opened.items():
         try:
-            out[sym] = round((now - datetime.fromisoformat(ts)).total_seconds() / 86400, 1)
-        except (TypeError, ValueError):
+            days = round((now - datetime.fromisoformat(e["timestamp"])).total_seconds() / 86400, 1)
+        except (KeyError, TypeError, ValueError):
             continue
+        out[sym] = {"days": days, "thesis": (e.get("reasoning") or "")[:300]}
     return out
+
+
+def recent_trades(n=RECENT_TRADES_SHOWN):
+    """The model's last n trades, newest first, as prompt lines.
+
+    Without this every run starts from nothing: it sold TSLL, and fifteen
+    minutes later bought it back with a fresh reason, 108 times in six weeks.
+    """
+    now = datetime.now(timezone.utc)
+    lines = []
+    for e in reversed(_log_events("order")[-n:]):
+        o = e.get("order") or {}
+        try:
+            hours = (now - datetime.fromisoformat(e["timestamp"])).total_seconds() / 3600
+        except (KeyError, TypeError, ValueError):
+            continue
+        age = f"{hours:.1f}h ago" if hours < 48 else f"{hours / 24:.1f}d ago"
+        size = (f"${float(o['notional']):,.0f}" if o.get("notional")
+                else f"{float(o.get('qty') or 0):g} sh")
+        lines.append(f"- {age}: {(o.get('side') or '').upper()} {o.get('symbol')} "
+                     f"{size} - {(e.get('reasoning') or '').strip()[:200]}")
+    return "\n".join(lines) or "(no trades yet)"
 
 
 def submit_order(order):
@@ -443,12 +499,131 @@ def fetch_news(tickers, days=NEWS_LOOKBACK_DAYS):
         print(f"  [warn] news fetch failed: {e}")
         return []
     pool = set(tickers)
-    return [{"when": (n.get("created_at") or "")[:10],
-             "symbols": [x for x in (n.get("symbols") or []) if x in pool],
-             "headline": (n.get("headline") or "").strip(),
-             "summary": (n.get("summary") or "").strip()[:300],
-             "source": n.get("source") or ""}
-            for n in items if n.get("headline")]
+    out = []
+    for n in items:
+        syms = [x for x in (n.get("symbols") or []) if x in pool]
+        if not n.get("headline") or len(syms) >= ROUNDUP_TICKERS:
+            continue
+        out.append({"when": (n.get("created_at") or "")[:10],
+                    "symbols": syms,
+                    "headline": (n.get("headline") or "").strip(),
+                    "summary": (n.get("summary") or "").strip()[:300],
+                    "source": n.get("source") or ""})
+    return out
+
+
+def _rss(url):
+    """[(published, title, source)] from an RSS feed; [] on any failure.
+
+    Non-fatal like every news source here: a dead feed costs headlines, never
+    the cycle.
+    """
+    try:
+        r = requests.get(url, timeout=15, headers={"User-Agent": RSS_UA})
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+    except Exception as e:
+        print(f"  [warn] rss {url[:70]} failed: {e}")
+        return []
+    out = []
+    for it in root.iter("item"):
+        try:
+            when = parsedate_to_datetime(it.findtext("pubDate"))
+        except (TypeError, ValueError):
+            continue
+        if when.tzinfo is None:            # "-0000" parses as naive
+            when = when.replace(tzinfo=timezone.utc)
+        out.append((when, (it.findtext("title") or "").strip(),
+                    (it.findtext("source") or "").strip()))
+    return out
+
+
+_NAMES = {}
+
+
+def company_name(sym):
+    """Searchable company name: "NVIDIA Corporation Common Stock" -> "NVIDIA".
+
+    Cached for the process, one Alpaca call per name per session. Falls back
+    to the symbol when the lookup fails.
+    """
+    if sym not in _NAMES:
+        try:
+            raw = _api("GET", TRADE_URL, f"/v2/assets/{sym}").get("name") or ""
+        except Exception:
+            raw = ""
+        _NAMES[sym] = clean_company_name(raw) or sym
+    return _NAMES[sym]
+
+
+def clean_company_name(raw):
+    # cut at the share-class boilerplate, then drop legal suffixes
+    name = re.split(r"\s+(?:Class\s|Common\s|Ordinary\s|American Depositary|"
+                    r"Sponsored\s|ADR\b|ETF\b|Shares\b)", raw, maxsplit=1)[0]
+    name = re.sub(r"[,.]?\s+(?:Inc|Corp|Corporation|Ltd|Limited|Co|plc|"
+                  r"N\.V|S\.A|AG|SE|LP)\.?$", "", name.strip())
+    return name.strip(" ,.")
+
+
+def fetch_rss_news(tickers, days=NEWS_LOOKBACK_DAYS):
+    """Per-name headlines from major outlets via Google News, newest first."""
+    sites = " OR ".join(f"site:{s}" for s in RSS_OUTLETS)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    out = []
+    for t in tickers:
+        name = company_name(t)
+        q = quote_plus(f'"{name}" ({sites}) when:{days}d')
+        # Google's own order is relevance; keep it. Sorting by date surfaced
+        # market wraps that mention the name once, so the name (or symbol)
+        # must also be in the headline itself.
+        about = re.compile(rf"\b(?:{re.escape(name)}|{re.escape(t)})\b", re.I)
+        items = [i for i in _rss("https://news.google.com/rss/search?q="
+                                 f"{q}&hl=en-US&gl=US&ceid=US:en")
+                 if i[0] >= cutoff and about.search(i[1])]
+        for when, title, src in items[:RSS_PER_TICKER]:
+            out.append({"when": when.strftime("%Y-%m-%d"), "symbols": [t],
+                        "headline": strip_publisher(title, src), "summary": "",
+                        "source": src or "google news"})
+    return out
+
+
+def strip_publisher(title, src):
+    """Google appends " - Publisher" to every title."""
+    return title[:-len(src) - 3] if src and title.endswith(f" - {src}") else title
+
+
+def fetch_market_news(limit=MARKET_HEADLINES):
+    """Newest Bloomberg markets headlines from the last two days."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=2)
+    items = sorted((i for i in _rss(MARKET_FEED) if i[0] >= cutoff), reverse=True)
+    return [{"when": w.strftime("%Y-%m-%d"), "symbols": [], "headline": t,
+             "summary": "", "source": "bloomberg"} for w, t, _ in items[:limit]]
+
+
+def news_key(headline):
+    return re.sub(r"\W+", "", headline.lower())[:60]
+
+
+def merge_news(*sources):
+    """One list, newest day first, the same story kept once."""
+    seen, out = set(), []
+    for n in sorted((n for s in sources for n in s),
+                    key=lambda n: n["when"], reverse=True):
+        k = news_key(n["headline"])
+        if k and k not in seen:
+            seen.add(k)
+            out.append(n)
+    return out
+
+
+def last_seen_headlines():
+    """Headline keys the previous decision already had in front of it."""
+    calls = _log_events("decisions")
+    if not calls:
+        return set()
+    last = calls[-1]
+    return {news_key(n.get("headline") or "")
+            for n in (last.get("news") or []) + (last.get("market_news") or [])}
 
 # ----------------------------- LLM ---------------------------------------
 
@@ -462,20 +637,25 @@ def is_earnings(n):
                for w in EARNINGS_WORDS)
 
 
-def format_news(news, empty="(no headlines for these names)"):
+def format_news(news, empty="(no headlines for these names)", seen=frozenset()):
+    """Seen headlines shrink to one tagged line: the model already weighed
+    them last run, and rereading them as fresh is how old news kept moving it.
+    """
     lines = []
     for n in news:
+        old = news_key(n["headline"]) in seen
         tag = ", ".join(n["symbols"]) or "market"
-        head = f"- [{n['when']}] {tag}: {n['headline']}"
+        head = f"- {'(seen) ' if old else ''}[{n['when']}] {tag}: {n['headline']}"
         if n["source"]:
             head += f" ({n['source']})"
-        if n["summary"]:
+        if n["summary"] and not old:
             head += f"\n    {n['summary']}"
         lines.append(head)
     return "\n".join(lines) or empty
 
 
-def build_prompt(market_data, account, positions, day, news, held_days):
+def build_prompt(market_data, account, positions, day, news, held_days,
+                 market_news=(), recent="(no trades yet)", seen=frozenset()):
     holdings = {
         t: {"shares": round(p["qty_f"], 6),
             "avg_entry": p["avg_entry"],
@@ -483,7 +663,8 @@ def build_prompt(market_data, account, positions, day, news, held_days):
             "market_value": p["market_value"],
             "unrealized_pl": p["unrealized_pl"],
             "unrealized_pct": p["unrealized_plpc"],
-            "days_held": held_days.get(t)}
+            "days_held": (held_days.get(t) or {}).get("days"),
+            "why_you_bought": (held_days.get(t) or {}).get("thesis")}
         for t, p in positions.items()
     }
     earnings = [n for n in news if is_earnings(n)]
@@ -518,8 +699,12 @@ TODAY: {day['weekday']} {day['date']}, market is {day['status']}.
 
 Account equity: ${float(account['equity']):.2f}
 Cash on hand:   ${float(account['cash']):.2f}
-Current positions (shares, entry, and how long they have been held):
+Current positions (shares, entry, how long held, and your own reasoning
+when you bought - judge each against that thesis, not against today's mood):
 {json.dumps(holdings, indent=2)}
+
+YOUR RECENT TRADES, newest first. This is your memory of earlier runs:
+{recent}
 
 Candidates (today's most-active names and biggest movers, Alpaca IEX feed).
 `daily_closes` is the last {DAILY_BARS_SHOWN} daily closes (oldest first) -
@@ -532,26 +717,37 @@ EARNINGS AND GUIDANCE, last {NEWS_LOOKBACK_DAYS} days. Over a swing horizon
 this is the single hardest-hitting input you have - a beat with raised
 guidance, or a miss with a cut, resets the multi-day trend no matter what
 the chart was doing. Read it before the chart:
-{format_news(earnings, "(no earnings or guidance news in this window)")}
+{format_news(earnings, "(no earnings or guidance news in this window)", seen)}
 
 OTHER RECENT NEWS for these names (last {NEWS_LOOKBACK_DAYS} days, newest
-first). Weigh this too: over a multi-day horizon a catalyst matters more
-than the chart. Say in your reasoning when a headline drove the call:
-{format_news(rest)}
+first; Benzinga plus Bloomberg, Reuters, CNBC, WSJ and others). Weigh this
+too: over a multi-day horizon a catalyst matters more than the chart. Say in
+your reasoning when a headline drove the call. Lines marked (seen) were
+already in front of you last run - they are not new information:
+{format_news(rest, seen=seen)}
 
-YOU choose which of these to trade. This is an ACTIVE experiment: cash
-sitting idle earns nothing and generates no data, so bias toward holding
-real positions - but "active" means committed, not twitchy.
+MARKET BACKDROP (Bloomberg markets, last 2 days). Context for risk, not a
+reason to trade any single name:
+{format_news(list(market_news), "(no market headlines)", seen)}
+
+YOU choose which of these to trade. You are asked again every 15 minutes,
+so on most runs the right answer is to change nothing. Trade only when
+something has changed since your recent trades above: new news, an
+earnings print, a broken multi-day trend. A price wiggle is not a change.
 
 - Aim to keep roughly {TARGET_DEPLOYED_PCT}% of total equity deployed,
   spread across about 2 to 5 names.
-- Open a position when the multi-day trend and the news agree. A modest
-  edge is enough; you do not need a textbook setup.
+- Open a position only when the multi-day trend and the news agree and you
+  can say why it should beat QQQ over the next one to three weeks.
 - Once you own something, give the thesis room to work. Do not sell a
   position that is a day or two old just because it moved against you
   slightly. Sell when the thesis breaks, the news turns, or it has run.
-- If you are already near the target deployment, rotate: sell the weakest
-  thesis and buy a stronger one, rather than adding on top.
+- Do not rotate for a slightly better-looking name. Every round trip pays
+  the spread, and selling working positions to chase the next idea is
+  exactly how this portfolio has lost money so far. If you are near the
+  target deployment, a new idea is usually a pass.
+- Do not buy back a name you sold in the last two days, or sell one you
+  bought in the last two days, unless news changed in between.
 
 For each ticker you want to act on, give: buy, sell, or hold.
 - If buy: specify dollar amount to allocate (must not exceed available cash
@@ -748,12 +944,20 @@ def run_once():
 
     baseline = load_baseline(market_data, float(account["equity"]))
 
-    news = fetch_news(list(market_data))
-    print(f"  news headlines: {len(news)}")
+    # never the benchmarks: Benzinga tags every market wrap with SPY and QQQ,
+    # which is what used to fill the whole 50-headline budget
+    names = [t for t in market_data if t not in BENCHMARKS]
+    news = merge_news(fetch_news(names), fetch_rss_news(names))
+    market_news = fetch_market_news()
+    seen = last_seen_headlines()
+    print(f"  news headlines: {len(news)} "
+          f"({sum(news_key(n['headline']) not in seen for n in news)} new), "
+          f"market: {len(market_news)}")
 
     try:
         decisions, meta = call_llm(build_prompt(
-            market_data, account, positions, day, news, holding_days(positions)))
+            market_data, account, positions, day, news, holding_days(positions),
+            market_news=market_news, recent=recent_trades(), seen=seen))
     except Exception as e:
         print(f"LLM call failed: {e}")
         # logged, not just printed, so the dashboard can show what broke
@@ -772,6 +976,7 @@ def run_once():
         "effort": meta["effort"],
         "day": day,
         "news": news,
+        "market_news": market_news,
         "candidates": sorted(t for t in market_data if t not in BENCHMARKS),
         "decisions": [
             {"ticker": d.get("ticker"),
@@ -974,16 +1179,51 @@ def selftest():
     real, LOG_FILE = LOG_FILE, Path(__file__).parent / "_tmp_selftest_log.jsonl"
     old = (datetime.now(timezone.utc) - timedelta(days=6)).isoformat()
     recent = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    rebuy = (datetime.now(timezone.utc) - timedelta(hours=23)).isoformat()
     LOG_FILE.write_text("".join(json.dumps(e) + "\n" for e in [
-        {"type": "order", "timestamp": old, "order": {"symbol": "AAA", "side": "buy"}},
+        # a later cycle's line merged in ahead of earlier ones, as git does
+        {"type": "order", "timestamp": rebuy, "order": {"symbol": "BBB", "side": "buy",
+                                                         "notional": 500}},
+        {"type": "order", "timestamp": old, "order": {"symbol": "AAA", "side": "buy"},
+         "reasoning": "Beat and raised."},
         {"type": "order", "timestamp": old, "order": {"symbol": "BBB", "side": "buy"}},
-        {"type": "order", "timestamp": recent, "order": {"symbol": "BBB", "side": "sell"}},
-        {"type": "order", "timestamp": recent, "order": {"symbol": "BBB", "side": "buy"}},
+        {"type": "order", "timestamp": recent, "order": {"symbol": "BBB", "side": "sell",
+                                                          "qty": "3"}},
+        {"type": "decisions", "timestamp": recent,
+         "news": [{"headline": "BBB wins a contract"}],
+         "market_news": [{"headline": "Stocks slip"}]},
     ]))
     ages = holding_days({"AAA", "BBB"})
+    memory = recent_trades()
+    seen_keys = last_seen_headlines()
     LOG_FILE.unlink()
     LOG_FILE = real
-    assert round(ages["AAA"]) == 6 and round(ages["BBB"]) == 1, ages
+    assert round(ages["AAA"]["days"]) == 6 and ages["AAA"]["thesis"] == "Beat and raised.", ages
+    # file order would have ended on the sell; time order ends on the rebuy
+    assert "BBB" in ages and round(ages["BBB"]["days"]) == 1, ages
+    assert memory.splitlines()[-1].startswith("- 6.0d ago: BUY AAA"), memory
+    assert "SELL BBB 3 sh" in memory and "BUY BBB $500" in memory, memory
+    assert seen_keys == {news_key("BBB wins a contract"), news_key("Stocks slip")}
+
+    # news: seen headlines shrink, duplicates across sources collapse
+    shown = format_news([{"when": "2026-08-27", "symbols": ["BBB"], "source": "x",
+                          "headline": "BBB wins a contract", "summary": "Big."}],
+                        seen=seen_keys)
+    assert "(seen)" in shown and "Big." not in shown, shown
+    merged = merge_news(
+        [{"when": "2026-08-26", "headline": "Nvidia beats!", "symbols": ["NVDA"]}],
+        [{"when": "2026-08-27", "headline": "nvidia BEATS", "symbols": ["NVDA"]},
+         {"when": "2026-08-27", "headline": "AMD slips", "symbols": ["AMD"]}])
+    assert [n["headline"] for n in merged] == ["nvidia BEATS", "AMD slips"], merged
+    assert strip_publisher("Nvidia rallies - Reuters", "Reuters") == "Nvidia rallies"
+    assert strip_publisher("Nvidia rallies", "") == "Nvidia rallies"
+    for raw, want in (("NVIDIA Corporation Common Stock", "NVIDIA"),
+                      ("Nu Holdings Ltd. Class A Ordinary Shares", "Nu Holdings"),
+                      ("Intel Corp", "Intel"),
+                      ("Apple Inc. Common Stock", "Apple"),
+                      ("SPDR S&P 500 ETF Trust", "SPDR S&P 500"),
+                      ("", "")):
+        assert clean_company_name(raw) == want, (raw, clean_company_name(raw))
 
     # the prompt must state the horizon, the day, and the weekend carry
     prompt = build_prompt(
@@ -1001,8 +1241,13 @@ def selftest():
           "summary": "EPS above consensus."},
          {"when": "2026-08-26", "symbols": ["AAPL"], "source": "benzinga",
           "headline": "Apple opens a new store in Ohio", "summary": ""}],
-        {"AAPL": 4.0})
+        {"AAPL": {"days": 4.0, "thesis": "Services growth."}},
+        market_news=[{"when": "2026-08-27", "symbols": [], "source": "bloomberg",
+                      "headline": "Stocks fall on inflation worry", "summary": ""}],
+        recent="- 1.0h ago: SELL TSLL 10 sh - weak")
     for must in ("SWING", "Friday 2026-08-28", "3 days away", "days_held",
+                 "Services growth.", "YOUR RECENT TRADES", "SELL TSLL",
+                 "MARKET BACKDROP", "inflation worry",
                  "Cash on hand", "OTHER RECENT NEWS", "daily_closes",
                  # the objective the whole experiment is scored on
                  "beat a buy-and-hold of SPY and QQQ",
@@ -1053,7 +1298,11 @@ def selftest():
             return {"news": [{"headline": "AAA wins a contract",
                               "summary": "Big one.", "source": "benzinga",
                               "symbols": ["AAA", "ZZZ"],
-                              "created_at": "2026-08-27T12:00:00Z"}]}
+                              "created_at": "2026-08-27T12:00:00Z"},
+                             {"headline": "Stocks moving premarket",
+                              "summary": "", "source": "benzinga",
+                              "symbols": ["AAA", "BBB", "CCC"],
+                              "created_at": "2026-08-27T11:00:00Z"}]}
         raise AssertionError(path)
 
     live_api, _api = _api, fake_api
@@ -1069,6 +1318,7 @@ def selftest():
         held = get_positions()
         md = fetch_market_data(["AAA", "ZZZ", "QQQQ"], "2026-08-28")
         news = fetch_news(["AAA"])
+        pool_news = fetch_news(["AAA", "BBB", "CCC"])
     finally:
         _api = live_api
 
@@ -1118,6 +1368,8 @@ def selftest():
     assert 1.5 < slept[0] < 2.5, f"3s interval minus 1s of work, got {slept}"
     # news is filtered down to the pool we asked about
     assert news[0]["symbols"] == ["AAA"] and news[0]["when"] == "2026-08-27", news
+    # a headline tagging three names in the pool is a roundup, not news
+    assert [n["headline"] for n in pool_news] == ["AAA wins a contract"], pool_news
 
     print("selftest OK")
 

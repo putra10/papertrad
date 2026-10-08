@@ -822,7 +822,10 @@ def call_llm(prompt, effort="high"):
             # seconds). The cheapest host cost $0.000765 and the fastest
             # $0.000913 -- a fifth of a cent to stop a single cycle from
             # eating two thirds of the 15-minute interval.
-            "provider": {"sort": "throughput"},
+            # max_price ($/M tokens) keeps the speed pick off hosts charging
+            # 5-6x list: by 2026-10 some calls cost ~$0.012 instead of ~$0.0015.
+            "provider": {"sort": "throughput",
+                         "max_price": {"prompt": 0.15, "completion": 0.30}},
             # models that support thinking will use it; the rest ignore this
             "reasoning": {"effort": effort},
         },
